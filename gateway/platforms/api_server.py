@@ -431,6 +431,37 @@ def _openai_error(message: str, err_type: str = "invalid_request_error", param: 
     }
 
 
+class ModelAliasNotFound(ValueError):
+    """Raised when a client requests an unknown configured API-server model."""
+
+
+class ModelAliasMisconfigured(RuntimeError):
+    """Raised when a configured API-server model alias cannot be used."""
+
+
+class ModelAliasInvalid(ValueError):
+    """Raised when a client sends an invalid model field."""
+
+
+def _resolve_api_key(spec: Dict[str, Any]) -> str:
+    """Resolve an API key from a model route spec.
+
+    The env lookup intentionally happens per request so secret rotation can be
+    picked up by newly-created agents without rebuilding the image.
+    """
+    if spec.get("api_key"):
+        return str(spec["api_key"])
+    env_var = spec.get("api_key_env")
+    if env_var:
+        value = os.environ.get(str(env_var), "")
+        if not value:
+            raise ModelAliasMisconfigured(
+                f"api_key_env={env_var!r} is unset for the requested model alias"
+            )
+        return value
+    return ""
+
+
 if AIOHTTP_AVAILABLE:
     @web.middleware
     async def body_limit_middleware(request, handler):
@@ -581,6 +612,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._model_name: str = self._resolve_model_name(
             extra.get("model_name", os.getenv("API_SERVER_MODEL_NAME", "")),
         )
+        self._models_map: Dict[str, Dict[str, Any]] = self._load_models_map(extra)
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
@@ -610,6 +642,42 @@ class APIServerAdapter(BasePlatformAdapter):
             items = [str(value)]
 
         return tuple(str(item).strip() for item in items if str(item).strip())
+
+    @staticmethod
+    def _load_models_map(extra: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        """Normalize optional OpenAI API model aliases from config."""
+        if "models" not in extra or extra.get("models") is None:
+            return {}
+        raw = extra["models"]
+        if not isinstance(raw, dict):
+            raise ValueError(
+                f"platforms.api_server.models must be a mapping, got {type(raw).__name__}"
+            )
+
+        models: Dict[str, Dict[str, Any]] = {}
+        for alias, spec in raw.items():
+            alias_key = str(alias).strip()
+            if not alias_key:
+                logger.warning("Skipping api_server model with empty alias")
+                continue
+            if not isinstance(spec, dict):
+                logger.warning("Skipping api_server model %r: spec must be a mapping", alias)
+                continue
+            model = str(spec.get("model") or "").strip()
+            if not model:
+                logger.warning("Skipping api_server model %r: missing model", alias)
+                continue
+            models[alias_key] = {
+                "model": model,
+                "provider": str(spec.get("provider") or "").strip() or None,
+                "base_url": str(spec.get("base_url") or "").strip() or None,
+                "api_key": spec.get("api_key"),
+                "api_key_env": spec.get("api_key_env"),
+                "api_mode": str(spec.get("api_mode") or "").strip() or None,
+            }
+        if not models:
+            raise ValueError("platforms.api_server.models must contain at least one valid model")
+        return models
 
     @staticmethod
     def _resolve_model_name(explicit: str) -> str:
@@ -717,6 +785,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        model_override: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -732,6 +801,14 @@ class APIServerAdapter(BasePlatformAdapter):
 
         runtime_kwargs = _resolve_runtime_agent_kwargs()
         model = _resolve_gateway_model()
+        if model_override:
+            if model_override.get("model"):
+                model = model_override["model"]
+            for key in ("provider", "api_key", "base_url", "api_mode"):
+                runtime_kwargs[key] = model_override.get(key)
+            runtime_kwargs["credential_pool"] = None
+            runtime_kwargs["command"] = None
+            runtime_kwargs["args"] = []
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
@@ -792,10 +869,26 @@ class APIServerAdapter(BasePlatformAdapter):
         })
 
     async def _handle_models(self, request: "web.Request") -> "web.Response":
-        """GET /v1/models — return hermes-agent as an available model."""
+        """GET /v1/models — return configured aliases or a single default model."""
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
+
+        created = int(time.time())
+        if self._models_map:
+            data = [
+                {
+                    "id": alias,
+                    "object": "model",
+                    "created": created,
+                    "owned_by": "hermes",
+                    "permission": [],
+                    "root": alias,
+                    "parent": None,
+                }
+                for alias in sorted(self._models_map)
+            ]
+            return web.json_response({"object": "list", "data": data})
 
         return web.json_response({
             "object": "list",
@@ -803,7 +896,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 {
                     "id": self._model_name,
                     "object": "model",
-                    "created": int(time.time()),
+                    "created": created,
                     "owned_by": "hermes",
                     "permission": [],
                     "root": self._model_name,
@@ -811,6 +904,53 @@ class APIServerAdapter(BasePlatformAdapter):
                 }
             ],
         })
+
+    def _resolve_model_override(self, requested: Any) -> Optional[Dict[str, Any]]:
+        """Resolve a client model alias to per-request AIAgent kwargs.
+
+        Legacy single-model API servers keep accepting arbitrary echoed model
+        names. Alias validation is enforced only when a models map is configured.
+        """
+        if not self._models_map:
+            return None
+        if not requested:
+            return None
+        if not isinstance(requested, str):
+            raise ModelAliasInvalid("'model' must be a string")
+
+        spec = self._models_map.get(requested)
+        if spec is None:
+            raise ModelAliasNotFound(f"Unknown model: {requested}")
+
+        api_key = None
+        if spec.get("api_key") is not None or spec.get("api_key_env"):
+            api_key = _resolve_api_key(spec)
+
+        return {
+            "model": spec["model"],
+            "provider": spec.get("provider"),
+            "api_key": api_key,
+            "base_url": spec.get("base_url"),
+            "api_mode": spec.get("api_mode"),
+        }
+
+    def _model_not_found_response(self, exc: ModelAliasNotFound) -> "web.Response":
+        return web.json_response(
+            _openai_error(str(exc), param="model", code="model_not_found"),
+            status=400,
+        )
+
+    def _model_invalid_response(self, exc: ModelAliasInvalid) -> "web.Response":
+        return web.json_response(
+            _openai_error(str(exc), param="model", code="invalid_model"),
+            status=400,
+        )
+
+    def _model_misconfigured_response(self, exc: ModelAliasMisconfigured) -> "web.Response":
+        return web.json_response(
+            _openai_error(str(exc), err_type="server_error", param="model", code="model_misconfigured"),
+            status=503,
+        )
 
     async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
         """GET /v1/capabilities — advertise the stable API surface.
@@ -823,10 +963,12 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        models = sorted(self._models_map)
         return web.json_response({
             "object": "hermes.api_server.capabilities",
             "platform": "hermes-agent",
-            "model": self._model_name,
+            "model": models[0] if models else self._model_name,
+            "models": models or [self._model_name],
             "auth": {
                 "type": "bearer",
                 "required": bool(self._api_key),
@@ -964,6 +1106,14 @@ class APIServerAdapter(BasePlatformAdapter):
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
+        try:
+            model_override = self._resolve_model_override(model_name)
+        except ModelAliasNotFound as exc:
+            return self._model_not_found_response(exc)
+        except ModelAliasInvalid as exc:
+            return self._model_invalid_response(exc)
+        except ModelAliasMisconfigured as exc:
+            return self._model_misconfigured_response(exc)
         created = int(time.time())
 
         if stream:
@@ -1047,6 +1197,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
+                model_override=model_override,
             ))
 
             return await self._write_sse_chat_completion(
@@ -1061,6 +1212,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=history,
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
+                model_override=model_override,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -1850,6 +2002,16 @@ class APIServerAdapter(BasePlatformAdapter):
         # groups the entire conversation under one session entry.
         session_id = stored_session_id or str(uuid.uuid4())
 
+        model_name = body.get("model", self._model_name)
+        try:
+            model_override = self._resolve_model_override(model_name)
+        except ModelAliasNotFound as exc:
+            return self._model_not_found_response(exc)
+        except ModelAliasInvalid as exc:
+            return self._model_invalid_response(exc)
+        except ModelAliasMisconfigured as exc:
+            return self._model_misconfigured_response(exc)
+
         stream = bool(body.get("stream", False))
         if stream:
             # Streaming branch — emit OpenAI Responses SSE events as the
@@ -1902,10 +2064,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
+                model_override=model_override,
             ))
 
             response_id = f"resp_{uuid.uuid4().hex[:28]}"
-            model_name = body.get("model", self._model_name)
             created_at = int(time.time())
 
             return await self._write_sse_responses(
@@ -1930,6 +2092,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=conversation_history,
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
+                model_override=model_override,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -1982,7 +2145,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "object": "response",
             "status": "completed",
             "created_at": created_at,
-            "model": body.get("model", self._model_name),
+            "model": model_name,
             "output": output_items,
             "usage": {
                 "input_tokens": usage.get("input_tokens", 0),
@@ -2326,6 +2489,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
+        model_override: Optional[Dict[str, Any]] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -2348,6 +2512,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_progress_callback=tool_progress_callback,
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
+                model_override=model_override,
             )
             if agent_ref is not None:
                 agent_ref[0] = agent
@@ -2510,6 +2675,15 @@ class APIServerAdapter(BasePlatformAdapter):
         run_id = f"run_{uuid.uuid4().hex}"
         session_id = body.get("session_id") or stored_session_id or run_id
         ephemeral_system_prompt = instructions
+        model_name = body.get("model", self._model_name)
+        try:
+            model_override = self._resolve_model_override(model_name)
+        except ModelAliasNotFound as exc:
+            return self._model_not_found_response(exc)
+        except ModelAliasInvalid as exc:
+            return self._model_invalid_response(exc)
+        except ModelAliasMisconfigured as exc:
+            return self._model_misconfigured_response(exc)
         loop = asyncio.get_running_loop()
         q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
         created_at = time.time()
@@ -2537,7 +2711,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "queued",
             created_at=created_at,
             session_id=session_id,
-            model=body.get("model", self._model_name),
+            model=model_name,
         )
 
         async def _run_and_close():
@@ -2548,6 +2722,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_id=session_id,
                     stream_delta_callback=_text_cb,
                     tool_progress_callback=event_cb,
+                    model_override=model_override,
                 )
                 self._active_run_agents[run_id] = agent
                 def _run_sync():
