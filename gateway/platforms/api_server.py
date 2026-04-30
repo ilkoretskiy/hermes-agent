@@ -927,12 +927,41 @@ class APIServerAdapter(BasePlatformAdapter):
             api_key = _resolve_api_key(spec)
 
         return {
+            "alias": requested,
             "model": spec["model"],
             "provider": spec.get("provider"),
             "api_key": api_key,
             "base_url": spec.get("base_url"),
             "api_mode": spec.get("api_mode"),
         }
+
+    def _routed_model_metadata_note(self, model_override: Optional[Dict[str, Any]]) -> Optional[str]:
+        if not model_override:
+            return None
+
+        alias = model_override.get("alias")
+        model = model_override.get("model")
+        if not alias or not model:
+            return None
+
+        return (
+            "Runtime model routing metadata: current requested alias is "
+            f"`{alias}`; backing model is `{model}`. If asked about the current "
+            "model, answer from this metadata rather than earlier conversation "
+            "text or config defaults."
+        )
+
+    def _append_routed_model_metadata(
+        self,
+        prompt: Optional[str],
+        model_override: Optional[Dict[str, Any]],
+    ) -> Optional[str]:
+        note = self._routed_model_metadata_note(model_override)
+        if note is None:
+            return prompt
+        if prompt:
+            return f"{prompt}\n\n{note}"
+        return note
 
     def _model_not_found_response(self, exc: ModelAliasNotFound) -> "web.Response":
         return web.json_response(
@@ -1114,6 +1143,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return self._model_invalid_response(exc)
         except ModelAliasMisconfigured as exc:
             return self._model_misconfigured_response(exc)
+        effective_system_prompt = self._append_routed_model_metadata(system_prompt, model_override)
         created = int(time.time())
 
         if stream:
@@ -1191,7 +1221,7 @@ class APIServerAdapter(BasePlatformAdapter):
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
                 conversation_history=history,
-                ephemeral_system_prompt=system_prompt,
+                ephemeral_system_prompt=effective_system_prompt,
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
                 tool_start_callback=_on_tool_start,
@@ -1210,7 +1240,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return await self._run_agent(
                 user_message=user_message,
                 conversation_history=history,
-                ephemeral_system_prompt=system_prompt,
+                ephemeral_system_prompt=effective_system_prompt,
                 session_id=session_id,
                 model_override=model_override,
             )
@@ -2011,6 +2041,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return self._model_invalid_response(exc)
         except ModelAliasMisconfigured as exc:
             return self._model_misconfigured_response(exc)
+        effective_instructions = self._append_routed_model_metadata(instructions, model_override)
 
         stream = bool(body.get("stream", False))
         if stream:
@@ -2057,7 +2088,7 @@ class APIServerAdapter(BasePlatformAdapter):
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
                 conversation_history=conversation_history,
-                ephemeral_system_prompt=instructions,
+                ephemeral_system_prompt=effective_instructions,
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
                 tool_progress_callback=_on_tool_progress,
@@ -2090,7 +2121,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return await self._run_agent(
                 user_message=user_message,
                 conversation_history=conversation_history,
-                ephemeral_system_prompt=instructions,
+                ephemeral_system_prompt=effective_instructions,
                 session_id=session_id,
                 model_override=model_override,
             )
@@ -2684,6 +2715,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return self._model_invalid_response(exc)
         except ModelAliasMisconfigured as exc:
             return self._model_misconfigured_response(exc)
+        ephemeral_system_prompt = self._append_routed_model_metadata(ephemeral_system_prompt, model_override)
         loop = asyncio.get_running_loop()
         q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
         created_at = time.time()

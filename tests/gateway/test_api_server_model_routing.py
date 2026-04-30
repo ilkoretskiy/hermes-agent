@@ -98,12 +98,44 @@ async def test_chat_completion_routes_requested_alias_to_backing_model(monkeypat
 
     assert resp.status == 200
     assert mock_run.call_args.kwargs["model_override"] == {
+        "alias": "hermes-dev-gpt",
         "model": "gpt-5.5",
         "provider": "openai",
         "api_key": "sk-openai",
         "base_url": None,
         "api_mode": None,
     }
+
+
+@pytest.mark.asyncio
+async def test_chat_completion_appends_routed_model_metadata_to_system_prompt(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
+    adapter = _adapter_with_models()
+    app = _create_app(adapter)
+
+    with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+        mock_run.return_value = (
+            {"final_response": "ok", "messages": [], "api_calls": 1},
+            {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        )
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "hermes-dev-gpt",
+                    "messages": [
+                        {"role": "system", "content": "You are concise."},
+                        {"role": "user", "content": "hello"},
+                    ],
+                },
+            )
+
+    assert resp.status == 200
+    prompt = mock_run.call_args.kwargs["ephemeral_system_prompt"]
+    assert "You are concise." in prompt
+    assert "Runtime model routing metadata" in prompt
+    assert "current requested alias is `hermes-dev-gpt`" in prompt
+    assert "backing model is `gpt-5.5`" in prompt
 
 
 @pytest.mark.asyncio
@@ -129,6 +161,7 @@ async def test_responses_routes_requested_alias_to_backing_model(monkeypatch):
 
     assert resp.status == 200
     assert mock_run.call_args.kwargs["model_override"] == {
+        "alias": "hermes-dev-gemini",
         "model": "gemini-3-flash-preview",
         "provider": "gemini",
         "api_key": "sk-google",
@@ -168,6 +201,9 @@ async def test_chat_completion_streaming_routes_requested_alias(monkeypatch):
     assert resp.status == 200
     assert mock_run.call_args.kwargs["model_override"]["model"] == "gpt-5.5"
     assert mock_run.call_args.kwargs["model_override"]["api_key"] == "sk-openai"
+    prompt = mock_run.call_args.kwargs["ephemeral_system_prompt"]
+    assert "current requested alias is `hermes-dev-gpt`" in prompt
+    assert "backing model is `gpt-5.5`" in prompt
 
 
 @pytest.mark.asyncio
@@ -202,6 +238,38 @@ async def test_responses_streaming_routes_requested_alias(monkeypatch):
     assert resp.status == 200
     assert mock_run.call_args.kwargs["model_override"]["model"] == "gemini-3-flash-preview"
     assert mock_run.call_args.kwargs["model_override"]["api_key"] == "sk-google"
+    prompt = mock_run.call_args.kwargs["ephemeral_system_prompt"]
+    assert "current requested alias is `hermes-dev-gemini`" in prompt
+    assert "backing model is `gemini-3-flash-preview`" in prompt
+
+
+@pytest.mark.asyncio
+async def test_responses_appends_routed_model_metadata_to_instructions(monkeypatch):
+    monkeypatch.setenv("GOOGLE_API_KEY", "sk-google")
+    adapter = _adapter_with_models()
+    app = _create_app(adapter)
+
+    with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+        mock_run.return_value = (
+            {"final_response": "ok", "messages": [], "api_calls": 1},
+            {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        )
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/responses",
+                json={
+                    "model": "hermes-dev-gemini",
+                    "instructions": "Answer tersely.",
+                    "input": "hello",
+                    "store": False,
+                },
+            )
+
+    assert resp.status == 200
+    prompt = mock_run.call_args.kwargs["ephemeral_system_prompt"]
+    assert "Answer tersely." in prompt
+    assert "current requested alias is `hermes-dev-gemini`" in prompt
+    assert "backing model is `gemini-3-flash-preview`" in prompt
 
 
 @pytest.mark.asyncio
@@ -236,6 +304,9 @@ async def test_runs_routes_requested_alias(monkeypatch):
 
     assert mock_create.call_args.kwargs["model_override"]["model"] == "gpt-5.5"
     assert mock_create.call_args.kwargs["model_override"]["api_key"] == "sk-openai"
+    prompt = mock_create.call_args.kwargs["ephemeral_system_prompt"]
+    assert "current requested alias is `hermes-dev-gpt`" in prompt
+    assert "backing model is `gpt-5.5`" in prompt
     assert status["model"] == "hermes-dev-gpt"
 
 
@@ -345,6 +416,12 @@ def test_create_agent_applies_model_override_without_primary_runtime_leaks(monke
     assert kwargs["credential_pool"] is None
     assert kwargs["command"] is None
     assert kwargs["args"] == []
+
+
+def test_routed_model_metadata_not_added_for_single_model_mode():
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"model_name": "dev"}))
+
+    assert adapter._append_routed_model_metadata("Existing prompt", None) == "Existing prompt"
 
 
 @pytest.mark.asyncio
