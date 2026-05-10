@@ -711,6 +711,63 @@ async def test_first_message_inside_topic_records_topic_binding(tmp_path, monkey
     assert binding["session_key"] == build_session_key(_make_source(thread_id="17585"))
 
 
+@pytest.mark.asyncio
+async def test_topic_binding_follows_session_id_after_compression_split(tmp_path, monkeypatch):
+    import gateway.run as gateway_run
+
+    session_db = SessionDB(db_path=tmp_path / "state.db")
+    session_db.enable_telegram_topic_mode(chat_id="208214988", user_id="208214988")
+    session_db.create_session(
+        session_id="sess-topic",
+        source="telegram",
+        user_id="208214988",
+    )
+    session_db.create_session(
+        session_id="sess-compressed",
+        source="telegram",
+        user_id="208214988",
+        parent_session_id="sess-topic",
+    )
+    source = _make_source(thread_id="17585")
+    session_db.bind_telegram_topic(
+        chat_id="208214988",
+        thread_id="17585",
+        user_id="208214988",
+        session_key=build_session_key(source),
+        session_id="sess-topic",
+    )
+
+    runner = _make_runner(session_db=session_db)
+    runner._bind_adapter_run_generation = MagicMock()
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "ok",
+            "messages": [],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 1234,
+            "model": "openai/test-model",
+            "session_id": "sess-compressed",
+        }
+    )
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    result = await runner._handle_message_with_agent(
+        _make_event("hello", thread_id="17585"),
+        source,
+        build_session_key(source),
+        1,
+    )
+
+    assert result == "ok"
+    binding = session_db.get_telegram_topic_binding(
+        chat_id="208214988",
+        thread_id="17585",
+    )
+    assert binding is not None
+    assert binding["session_id"] == "sess-compressed"
 
 
 @pytest.mark.asyncio
