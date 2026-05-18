@@ -305,6 +305,7 @@ def _setup_update_mocks(monkeypatch, tmp_path):
     monkeypatch.setattr(hermes_config, "get_missing_config_fields", lambda: [])
     monkeypatch.setattr(hermes_config, "check_config_version", lambda: (5, 5))
     monkeypatch.setattr(hermes_config, "migrate_config", lambda **kw: {"env_added": [], "config_added": []})
+    monkeypatch.setattr(hermes_main, "_warn_stale_dashboard_processes", lambda: None)
 
 
 def test_cmd_update_retries_optional_extras_individually_when_all_fails(monkeypatch, tmp_path, capsys):
@@ -612,3 +613,119 @@ def test_cmd_update_skips_stash_restore_when_reset_fails(monkeypatch, tmp_path, 
 
     out = capsys.readouterr().out
     assert "preserved in stash" in out
+
+
+# ---------------------------------------------------------------------------
+# Fork upstream sync helper
+# ---------------------------------------------------------------------------
+
+def _make_upstream_sync_run(
+    *,
+    origin_ahead="0",
+    upstream_ahead="0",
+    fetch_fails=False,
+    pull_fails=False,
+    push_ok=True,
+):
+    recorded = []
+
+    def fake_run(cmd, **kwargs):
+        recorded.append((cmd, kwargs))
+        if cmd == ["git", "remote", "get-url", "upstream"]:
+            return SimpleNamespace(
+                stdout="git@github.com:NousResearch/hermes-agent.git\n",
+                stderr="",
+                returncode=0,
+            )
+        if cmd == ["git", "fetch", "upstream", "--quiet"]:
+            if fetch_fails:
+                raise CalledProcessError(returncode=128, cmd=cmd)
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd == ["git", "rev-list", "--count", "upstream/main..origin/main"]:
+            return SimpleNamespace(stdout=f"{origin_ahead}\n", stderr="", returncode=0)
+        if cmd == ["git", "rev-list", "--count", "origin/main..upstream/main"]:
+            return SimpleNamespace(stdout=f"{upstream_ahead}\n", stderr="", returncode=0)
+        if cmd == ["git", "pull", "--ff-only", "upstream", "main"]:
+            if pull_fails:
+                raise CalledProcessError(returncode=128, cmd=cmd)
+            return SimpleNamespace(stdout="Updating\n", stderr="", returncode=0)
+        if cmd == ["git", "push", "origin", "main", "--force-with-lease"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0 if push_ok else 1)
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    return fake_run, recorded
+
+
+def test_sync_with_upstream_skips_when_origin_has_local_commits(
+    monkeypatch, tmp_path, capsys
+):
+    fake_run, recorded = _make_upstream_sync_run(origin_ahead="2", upstream_ahead="3")
+    monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+
+    hermes_main._sync_with_upstream_if_needed(["git"], tmp_path)
+
+    commands = [cmd for cmd, _ in recorded]
+    assert ["git", "pull", "--ff-only", "upstream", "main"] not in commands
+    out = capsys.readouterr().out
+    assert "not on upstream" in out
+    assert "git pull upstream main" in out
+
+
+def test_sync_with_upstream_noops_when_up_to_date(monkeypatch, tmp_path, capsys):
+    fake_run, recorded = _make_upstream_sync_run(origin_ahead="0", upstream_ahead="0")
+    monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+
+    hermes_main._sync_with_upstream_if_needed(["git"], tmp_path)
+
+    commands = [cmd for cmd, _ in recorded]
+    assert ["git", "pull", "--ff-only", "upstream", "main"] not in commands
+    assert "Fork is up to date with upstream" in capsys.readouterr().out
+
+
+def test_sync_with_upstream_pulls_and_pushes_when_upstream_is_ahead(
+    monkeypatch, tmp_path, capsys
+):
+    fake_run, recorded = _make_upstream_sync_run(origin_ahead="0", upstream_ahead="4")
+    monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+
+    hermes_main._sync_with_upstream_if_needed(["git"], tmp_path)
+
+    commands = [cmd for cmd, _ in recorded]
+    assert ["git", "pull", "--ff-only", "upstream", "main"] in commands
+    assert ["git", "push", "origin", "main", "--force-with-lease"] in commands
+    out = capsys.readouterr().out
+    assert "Updated from upstream" in out
+    assert "Fork synced with upstream" in out
+
+
+def test_sync_with_upstream_stops_when_fetch_fails(monkeypatch, tmp_path, capsys):
+    fake_run, recorded = _make_upstream_sync_run(fetch_fails=True)
+    monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+
+    hermes_main._sync_with_upstream_if_needed(["git"], tmp_path)
+
+    commands = [cmd for cmd, _ in recorded]
+    assert ["git", "rev-list", "--count", "upstream/main..origin/main"] not in commands
+    assert "Failed to fetch upstream" in capsys.readouterr().out
+
+
+def test_sync_with_upstream_can_decline_adding_missing_remote(monkeypatch, tmp_path, capsys):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd == ["git", "remote", "get-url", "upstream"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=2)
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+    monkeypatch.setattr(hermes_main, "_should_skip_upstream_prompt", lambda: False)
+    monkeypatch.setattr(hermes_main, "_mark_skip_upstream_prompt", lambda: None)
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "n")
+
+    hermes_main._sync_with_upstream_if_needed(["git"], tmp_path)
+
+    assert calls == [["git", "remote", "get-url", "upstream"]]
+    out = capsys.readouterr().out
+    assert "not tracking the official Hermes repository" in out
+    assert "Skipped" in out

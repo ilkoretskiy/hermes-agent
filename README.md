@@ -141,6 +141,8 @@ See `hermes claw migrate --help` for all options, or use the `openclaw-migration
 
 We welcome contributions! See the [Contributing Guide](https://hermes-agent.nousresearch.com/docs/developer-guide/contributing) for development setup, code style, and PR process.
 
+Fork maintainers should also see [Fork Maintenance](docs/fork-maintenance.md) for the neutral upstream-sync and local-fix workflow.
+
 Quick start for contributors — clone and go with `setup-hermes.sh`:
 
 ```bash
