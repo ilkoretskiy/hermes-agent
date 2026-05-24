@@ -1671,6 +1671,54 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
         filtered.append(msg)
     messages = filtered
 
+    # --- Drop stale Codex-ack continuation items ---------------------------
+    # The Codex-ack continuation path (conversation_loop.py) appends a
+    # synthetic ``incomplete`` assistant turn + a ``developer``-role
+    # "Continue now…" nudge to push Codex past an acknowledgement into
+    # actual tool use. Those items are only needed for the *immediate*
+    # retry API call; once the retry produces any real assistant turn
+    # (tool-calling OR text-only) the nudge has done its job and the
+    # synthetic pair becomes stale. Leaving them in would re-apply the
+    # nudge on every subsequent turn of a multi-turn session and leak a
+    # ``developer``-role item into non-Codex provider payloads (Anthropic,
+    # Bedrock, strict chat-completions providers) that may reject it.
+    #
+    # The retry is "closed" by any later assistant message that is not
+    # itself a synthetic interim — a regular tool-calling assistant turn,
+    # a plain text response, or a second ack-continuation's own interim
+    # all qualify. The synthetic interim is excluded so that immediately
+    # after appending the pair (interim is at idx, developer at idx+1,
+    # nothing later) sanitize keeps both items so the retry API call
+    # actually carries the nudge.
+    synthetic_indices = [
+        i for i, m in enumerate(messages)
+        if isinstance(m, dict) and (
+            m.get("_codex_ack_continuation_synthetic")
+            or m.get("_codex_ack_continuation_interim")
+        )
+    ]
+    if synthetic_indices:
+        drop_indices: set = set()
+        for idx in synthetic_indices:
+            for later in messages[idx + 1:]:
+                if not isinstance(later, dict):
+                    continue
+                if later.get("role") != "assistant":
+                    continue
+                # Skip other synthetic interims so a fresh continuation
+                # appended right above doesn't masquerade as "the retry
+                # closed" before its own retry has actually run.
+                if later.get("_codex_ack_continuation_interim"):
+                    continue
+                drop_indices.add(idx)
+                break
+        if drop_indices:
+            messages = [m for i, m in enumerate(messages) if i not in drop_indices]
+            _ra().logger.debug(
+                "Pre-call sanitizer: dropped %d stale Codex-ack continuation item(s)",
+                len(drop_indices),
+            )
+
     surviving_call_ids: set = set()
     for msg in messages:
         if msg.get("role") == "assistant":
@@ -1723,6 +1771,37 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
 
 
 
+# Path-shaped tokens: ``~/foo``, ``./foo``, ``../foo``, ``/abs/path``.
+# Stricter than ``"/" in text`` — a stray slash in "and/or" does not count
+# as a workspace reference. The token must start at a word boundary and
+# look like an actual path segment (root char + path char).
+_PATH_TOKEN_PATTERN = re.compile(
+    r"(?:^|[\s(\[`'\"])(?:~/|\.{1,2}/|/[A-Za-z_.\-])[\w./\-]*"
+)
+
+# Fenced code blocks (```...```) and double-quoted/smart-quoted dialogue
+# inside example openers. We strip these before applying the ack regex so
+# that the assistant *quoting* a sample line ("I'll throw you a topic")
+# does not count as the assistant itself promising future action.
+_FENCED_BLOCK_PATTERN = re.compile(r"```.*?```", re.DOTALL)
+_QUOTED_DIALOGUE_PATTERN = re.compile(r"[\"“]([^\"”]*)[\"”]")
+
+# Word-boundary patterns for action and workspace markers. Previously we
+# tested substring membership with ``"check" in text`` etc., which made
+# ``"repo" in user_text`` match the word "report" and ``"files"`` match
+# "profiles". Bound to word edges so accidental substring overlaps don't
+# qualify a chat session as workspace work.
+_ACTION_MARKER_PATTERN = re.compile(
+    r"\b(?:look\s+into|look\s+at|inspect|scan|check|analyz\w*|review|"
+    r"explore|read|open|run|test|fix|debug|search|find|walkthrough|"
+    r"report\s+back|summari[sz]\w*)\b"
+)
+_WORKSPACE_MARKER_PATTERN = re.compile(
+    r"\b(?:current\s+directory|current\s+dir|directory|cwd|repository|repo|"
+    r"codebase|project|folder|filesystem|file\s+tree|files|path)\b"
+)
+
+
 def looks_like_codex_intermediate_ack(
     agent,
     user_message: str,
@@ -1739,58 +1818,28 @@ def looks_like_codex_intermediate_ack(
     if len(assistant_text) > 1200:
         return False
 
+    # Quoted example dialogue ("I'll throw you a topic") and fenced code
+    # blocks are sample text, not the assistant's own commitments. Remove
+    # them before scanning for future-action acks so a tutor or roleplay
+    # message that *quotes* an opener does not trigger the nudge.
+    ack_scan_text = _FENCED_BLOCK_PATTERN.sub(" ", assistant_text)
+    ack_scan_text = _QUOTED_DIALOGUE_PATTERN.sub(" ", ack_scan_text)
+
     has_future_ack = bool(
-        re.search(r"\b(i['’]ll|i will|let me|i can do that|i can help with that)\b", assistant_text)
+        re.search(r"\b(i['’]ll|i will|let me|i can do that|i can help with that)\b", ack_scan_text)
     )
     if not has_future_ack:
         return False
 
-    action_markers = (
-        "look into",
-        "look at",
-        "inspect",
-        "scan",
-        "check",
-        "analyz",
-        "review",
-        "explore",
-        "read",
-        "open",
-        "run",
-        "test",
-        "fix",
-        "debug",
-        "search",
-        "find",
-        "walkthrough",
-        "report back",
-        "summarize",
-    )
-    workspace_markers = (
-        "directory",
-        "current directory",
-        "current dir",
-        "cwd",
-        "repo",
-        "repository",
-        "codebase",
-        "project",
-        "folder",
-        "filesystem",
-        "file tree",
-        "files",
-        "path",
-    )
-
     user_text = (user_message or "").strip().lower()
     user_targets_workspace = (
-        any(marker in user_text for marker in workspace_markers)
-        or "~/" in user_text
-        or "/" in user_text
+        bool(_WORKSPACE_MARKER_PATTERN.search(user_text))
+        or bool(_PATH_TOKEN_PATTERN.search(user_text))
     )
-    assistant_mentions_action = any(marker in assistant_text for marker in action_markers)
-    assistant_targets_workspace = any(
-        marker in assistant_text for marker in workspace_markers
+    assistant_mentions_action = bool(_ACTION_MARKER_PATTERN.search(ack_scan_text))
+    assistant_targets_workspace = (
+        bool(_WORKSPACE_MARKER_PATTERN.search(ack_scan_text))
+        or bool(_PATH_TOKEN_PATTERN.search(ack_scan_text))
     )
     return (user_targets_workspace or assistant_targets_workspace) and assistant_mentions_action
 

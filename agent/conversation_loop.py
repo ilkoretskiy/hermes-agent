@@ -3788,15 +3788,34 @@ def run_conversation(
                 ):
                     codex_ack_continuations += 1
                     interim_msg = agent._build_assistant_message(assistant_message, "incomplete")
+                    # Mark the interim ack and the developer nudge as
+                    # synthetic. Two layers consume the markers:
+                    # (1) ``sanitize_api_messages`` drops them from
+                    #     subsequent API calls once a tool-calling assistant
+                    #     turn appears after them, so the nudge is not
+                    #     re-applied on every turn and does not leak a
+                    #     ``developer`` role into non-Codex providers.
+                    # (2) ``_flush_messages_to_session_db`` skips them when
+                    #     writing to SQLite, so resumed sessions do not see
+                    #     these items in durable history.
+                    interim_msg["_codex_ack_continuation_interim"] = True
                     messages.append(interim_msg)
                     agent._emit_interim_assistant_message(interim_msg)
 
+                    # Use the ``developer`` role for the continuation nudge
+                    # rather than ``user``.  The previous "[System: ...]"
+                    # text-inside-user-message form impersonated the user in
+                    # session transcripts and could be mistaken for a real
+                    # turn (see Hermes false-positive analysis 2026-05-24).
+                    # The Codex Responses adapter passes ``developer`` items
+                    # through as developer-role instructions.
                     continue_msg = {
-                        "role": "user",
+                        "role": "developer",
                         "content": (
-                            "[System: Continue now. Execute the required tool calls and only "
-                            "send your final answer after completing the task.]"
+                            "Continue now. Execute the required tool calls and only "
+                            "send your final answer after completing the task."
                         ),
+                        "_codex_ack_continuation_synthetic": True,
                     }
                     messages.append(continue_msg)
                     agent._session_messages = messages

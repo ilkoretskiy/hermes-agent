@@ -46,6 +46,28 @@ class TestChatCompletionsBasic:
         assert "codex_reasoning_items" in msgs[0]
         assert "codex_message_items" in msgs[0]
 
+    def test_convert_messages_strips_codex_ack_continuation_markers(self, transport):
+        """Internal ``_codex_ack_continuation_synthetic`` /
+        ``_codex_ack_continuation_interim`` markers are in-memory bookkeeping
+        only — strict chat-completions providers reject any extra fields on
+        messages, so these must never reach the wire."""
+        msgs = [
+            {"role": "user", "content": "look at ~/foo"},
+            {"role": "assistant", "content": "I'll inspect ~/foo.",
+             "finish_reason": "incomplete",
+             "_codex_ack_continuation_interim": True},
+            {"role": "developer",
+             "content": "Continue now. Execute the required tool calls.",
+             "_codex_ack_continuation_synthetic": True},
+        ]
+        result = transport.convert_messages(msgs)
+        for m in result:
+            assert "_codex_ack_continuation_synthetic" not in m
+            assert "_codex_ack_continuation_interim" not in m
+        # Original list untouched (deepcopy-on-demand)
+        assert msgs[1]["_codex_ack_continuation_interim"] is True
+        assert msgs[2]["_codex_ack_continuation_synthetic"] is True
+
     def test_convert_messages_strips_tool_name(self, transport):
         """Internal `tool_name` (used for FTS indexing in the SQLite store) is
         not part of the OpenAI Chat Completions schema. Strict providers like

@@ -641,6 +641,63 @@ class TestChatMessagesToResponsesInput:
         # Assistant item uses output_text
         assert normalized[1]["content"][0]["type"] == "output_text"
 
+    def test_developer_role_message_string_content(self, monkeypatch):
+        """Developer-role nudges (Codex-ack continuation) must reach the
+        Responses API as developer-role input items with ``input_text``
+        content. ``role: system`` is silently dropped earlier in this
+        function; developer is the correct mid-conversation instruction
+        role for the Responses API."""
+        agent = _make_agent(monkeypatch, "openai-codex", api_mode="codex_responses",
+                            base_url="https://chatgpt.com/backend-api/codex")
+        messages = [
+            {"role": "user", "content": "look at ~/foo"},
+            {
+                "role": "developer",
+                "content": "Continue now. Execute the required tool calls.",
+                "_codex_ack_continuation_synthetic": True,
+            },
+        ]
+        items = _chat_messages_to_responses_input(messages)
+        # The developer item must be present and reach the API.
+        dev_items = [it for it in items if it.get("role") == "developer"]
+        assert len(dev_items) == 1
+        assert dev_items[0]["content"] == [{
+            "type": "input_text",
+            "text": "Continue now. Execute the required tool calls.",
+        }]
+        # The internal marker key must NOT leak into the outgoing item —
+        # the Responses API rejects unknown fields on input items.
+        assert "_codex_ack_continuation_synthetic" not in dev_items[0]
+
+    def test_developer_role_empty_content_dropped(self, monkeypatch):
+        """Empty developer-role content must not produce a stray input item."""
+        agent = _make_agent(monkeypatch, "openai-codex", api_mode="codex_responses",
+                            base_url="https://chatgpt.com/backend-api/codex")
+        messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "developer", "content": "   "},
+        ]
+        items = _chat_messages_to_responses_input(messages)
+        assert not any(it.get("role") == "developer" for it in items)
+
+    def test_preflight_accepts_developer_role(self, monkeypatch):
+        """_preflight_codex_input_items must validate developer-role items
+        alongside user/assistant, treating their content as input_text."""
+        agent = _make_agent(monkeypatch, "openai-codex", api_mode="codex_responses",
+                            base_url="https://chatgpt.com/backend-api/codex")
+        raw_input = [
+            {"role": "user", "content": [{"type": "input_text", "text": "look at ~/foo"}]},
+            {
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "Continue now."}],
+            },
+        ]
+        normalized = _preflight_codex_input_items(raw_input)
+        dev = [it for it in normalized if it.get("role") == "developer"]
+        assert len(dev) == 1
+        assert dev[0]["content"][0]["type"] == "input_text"
+        assert dev[0]["content"][0]["text"] == "Continue now."
+
 
 class TestChatContentToResponsesParts:
     """Unit tests for _chat_content_to_responses_parts role parameter (#15687)."""

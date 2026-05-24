@@ -272,6 +272,30 @@ def _chat_messages_to_responses_input(
         if role == "system":
             continue
 
+        # ``developer`` role carries mid-conversation instructions (e.g. the
+        # Codex-ack continuation nudge from ``conversation_loop.py``).  The
+        # OpenAI Responses API accepts developer-role input items with
+        # ``input_text`` parts, same shape as user input. Treat the content
+        # like a user message for conversion but emit the ``developer`` role
+        # in the outgoing item so the model sees it as an instruction, not
+        # as a user turn.
+        if role == "developer":
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                content_parts = _chat_content_to_responses_parts(content, role="user")
+                content_text = "".join(
+                    p.get("text", "") for p in content_parts if p.get("type") == "input_text"
+                )
+            else:
+                content_text = str(content) if content is not None else ""
+            if not content_text.strip():
+                continue
+            items.append({
+                "role": "developer",
+                "content": [{"type": "input_text", "text": content_text}],
+            })
+            continue
+
         if role in {"user", "assistant"}:
             content = msg.get("content", "")
             if isinstance(content, list):
@@ -611,7 +635,7 @@ def _preflight_codex_input_items(raw_items: Any) -> List[Dict[str, Any]]:
             continue
 
         role = item.get("role")
-        if role in {"user", "assistant"}:
+        if role in {"user", "assistant", "developer"}:
             content = item.get("content", "")
             if content is None:
                 content = ""
@@ -620,7 +644,8 @@ def _preflight_codex_input_items(raw_items: Any) -> List[Dict[str, Any]]:
                 # is already in Responses format (``input_text`` / ``output_text``
                 # / ``input_image``).  Validate each part and pass through.
                 # Use the correct text type for the role — ``output_text`` for
-                # assistant messages, ``input_text`` for user messages.
+                # assistant messages, ``input_text`` for user/developer
+                # messages (developer-role nudges are text-only instructions).
                 text_type = "output_text" if role == "assistant" else "input_text"
                 validated: List[Dict[str, Any]] = []
                 for part_idx, part in enumerate(content):

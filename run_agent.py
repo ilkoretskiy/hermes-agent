@@ -1254,6 +1254,18 @@ class AIAgent:
             start_idx = len(conversation_history) if conversation_history else 0
             flush_from = max(start_idx, self._last_flushed_db_idx)
             for msg in messages[flush_from:]:
+                # Skip synthetic Codex-ack continuation items. They live only
+                # for the immediate retry API call (see conversation_loop.py
+                # and the stale-drop logic in sanitize_api_messages) and have
+                # no value in durable session history — the in-memory marker
+                # keys are not persisted as columns, so a resumed session
+                # would see a bare ``developer``-role row with no way to
+                # filter it. Easier: don't persist them in the first place.
+                if isinstance(msg, dict) and (
+                    msg.get("_codex_ack_continuation_synthetic")
+                    or msg.get("_codex_ack_continuation_interim")
+                ):
+                    continue
                 role = msg.get("role", "unknown")
                 content = msg.get("content")
                 # Persist multimodal tool results as their text summary only —

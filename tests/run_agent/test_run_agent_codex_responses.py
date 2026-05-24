@@ -1507,9 +1507,21 @@ def test_run_conversation_codex_continues_after_ack_stop_message(monkeypatch):
         msg.get("role") == "assistant"
         and msg.get("finish_reason") == "incomplete"
         and "inspect ~/openclaw-studio" in (msg.get("content") or "")
+        and msg.get("_codex_ack_continuation_interim") is True
         for msg in result["messages"]
     )
+    # The continuation nudge is appended as a ``developer``-role message,
+    # not as a ``user`` message — see conversation_loop.py and
+    # codex_responses_adapter.py for why. It must reach the model but must
+    # not impersonate the user in transcript history.
     assert any(
+        msg.get("role") == "developer"
+        and "Continue now. Execute the required tool calls" in (msg.get("content") or "")
+        and msg.get("_codex_ack_continuation_synthetic") is True
+        for msg in result["messages"]
+    )
+    # Sanity: nothing the assistant pushed should be wearing the user role.
+    assert not any(
         msg.get("role") == "user"
         and "Continue now. Execute the required tool calls" in (msg.get("content") or "")
         for msg in result["messages"]
@@ -1548,14 +1560,74 @@ def test_run_conversation_codex_continues_after_ack_for_directory_listing_prompt
         msg.get("role") == "assistant"
         and msg.get("finish_reason") == "incomplete"
         and "current directory" in (msg.get("content") or "")
+        and msg.get("_codex_ack_continuation_interim") is True
         for msg in result["messages"]
     )
     assert any(
+        msg.get("role") == "developer"
+        and "Continue now. Execute the required tool calls" in (msg.get("content") or "")
+        and msg.get("_codex_ack_continuation_synthetic") is True
+        for msg in result["messages"]
+    )
+    assert not any(
         msg.get("role") == "user"
         and "Continue now. Execute the required tool calls" in (msg.get("content") or "")
         for msg in result["messages"]
     )
     assert any(msg.get("role") == "tool" and msg.get("tool_call_id") == "call_1" for msg in result["messages"])
+
+
+def test_codex_intermediate_ack_detector_skips_chat_session_with_quoted_examples(monkeypatch):
+    """Regression: a chat/tutor turn that *quotes* opener lines ("I'll throw…")
+    while asking the user to pick (a)/(b)/(c) must not trigger the Codex-ack
+    continuation nudge.
+
+    Repro of the 2026-05-24 false positive: a conversation-tutor system prompt
+    ended an assistant turn with "Quick voice check before we start." plus
+    three quoted opening lines, two of which contained the substring "I'll".
+    The old detector matched on the quoted "I'll" + the action word "check" +
+    a stray "/" anywhere in the (5KB) user prompt, and injected a fake
+    `[System: Continue now…]` user message. This regression test pins the
+    fix in agent_runtime_helpers.py.
+    """
+    agent = _build_agent(monkeypatch)
+    user_message = (
+        "You are my conversation tutor. Talk like a sharp friend over coffee, "
+        "not a grader. Pick a topic and we'll riff. Things I/we want to avoid: "
+        "moralizing, padding, hedging."
+    )
+    assistant_content = (
+        "Morning. Quick voice check before we start.\n\n"
+        "Same opening line three ways:\n\n"
+        "**(a) Cheeky owl**\n"
+        "“Alright, little talons out: here’s a take-bait topic — bite it or dodge it.”\n\n"
+        "**(b) Sharp friend**\n"
+        "“Morning. I’ll throw you something concrete, you give me your gut, and we’ll sharpen it.”\n\n"
+        "**(c) Light gamified**\n"
+        "“Morning. One small opinion rep: I’ll serve the topic, you take a swing, we level it up.”\n\n"
+        "Pick **a, b, or c**."
+    )
+    assert agent._looks_like_codex_intermediate_ack(
+        user_message=user_message,
+        assistant_content=assistant_content,
+        messages=[{"role": "user", "content": user_message}],
+    ) is False
+
+
+def test_codex_intermediate_ack_detector_still_fires_on_real_workspace_ack(monkeypatch):
+    """The fixed detector must still catch the case it was built for:
+    Codex says "I'll inspect ~/foo …" instead of calling a tool."""
+    agent = _build_agent(monkeypatch)
+    user_message = "look into ~/openclaw-studio and tell me how it works"
+    assistant_content = (
+        "Absolutely — I can do that. I'll inspect ~/openclaw-studio and "
+        "report back with a walkthrough."
+    )
+    assert agent._looks_like_codex_intermediate_ack(
+        user_message=user_message,
+        assistant_content=assistant_content,
+        messages=[{"role": "user", "content": user_message}],
+    ) is True
 
 
 def test_dump_api_request_debug_uses_responses_url(monkeypatch, tmp_path):
