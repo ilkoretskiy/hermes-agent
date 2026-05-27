@@ -20,6 +20,24 @@ RUN apt-get update && \
     curl nodejs npm python3 ripgrep ffmpeg gcc python3-dev libffi-dev procps git openssh-client docker-cli xz-utils && \
     rm -rf /var/lib/apt/lists/*
 
+# ---------- GitHub CLI (kori fork addition) ----------
+# Fork-only: install `gh` so agent loops running inside this container can
+# act on GitHub (read/write repos, issues, PRs) using a fine-grained PAT.
+# `gh` authenticates from the GH_TOKEN env var with no on-disk config —
+# the token is supplied via `env_file: .env` in docker-compose.yml.
+#
+# Lives in a separate apt repo (cli.github.com), hence the keyring +
+# sources.list dance instead of adding `gh` to the line above.
+RUN install -d -m 0755 /etc/apt/keyrings && \
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /etc/apt/keyrings/githubcli-archive-keyring.gpg && \
+    chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends gh && \
+    rm -rf /var/lib/apt/lists/*
+
 # ---------- s6-overlay install ----------
 # s6-overlay provides supervision for the main hermes process, the dashboard,
 # and per-profile gateways. /init becomes PID 1 below — see ENTRYPOINT.
