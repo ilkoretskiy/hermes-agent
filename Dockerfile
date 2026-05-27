@@ -38,6 +38,15 @@ RUN install -d -m 0755 /etc/apt/keyrings && \
     apt-get install -y --no-install-recommends gh && \
     rm -rf /var/lib/apt/lists/*
 
+# Fork-only: install `bd` (beads, issue tracker for coding agents). Single
+# statically-linked Go binary — no apt deps. Keeping bd in the image (not in
+# the persistent tools volume) so a fresh container always has it.
+# https://github.com/steveyegge/beads
+ARG BD_VERSION=1.0.4
+RUN curl -fsSL "https://github.com/steveyegge/beads/releases/download/v${BD_VERSION}/beads_${BD_VERSION}_linux_amd64.tar.gz" \
+      | tar -xz -C /usr/local/bin bd \
+    && bd --version
+
 # ---------- s6-overlay install ----------
 # s6-overlay provides supervision for the main hermes process, the dashboard,
 # and per-profile gateways. /init becomes PID 1 below — see ENTRYPOINT.
@@ -212,8 +221,18 @@ ENV HERMES_HOME=/opt/data
 # cont-init.d scripts don't pass through the wrapper. Expose the venv
 # bin globally so `docker exec <container> hermes ...` and any
 # subprocess that doesn't activate the venv first still find hermes.
-ENV PATH="/opt/hermes/.venv/bin:/opt/data/.local/bin:${PATH}"
-RUN mkdir -p /opt/data
+# /opt/tools is the persistent tools volume (bind-mounted via docker-compose
+# to ~/.hermes-tools on the host). Ad-hoc tool installs land there and survive
+# `docker compose up -d`. See MEMORY.md for the install-location rule.
+# PATH order: venv first (Hermes-internal), user-local, persistent tools, then
+# system. Tools-volume tools are findable above /usr/bin but can't shadow
+# Hermes' own toolchain in the venv.
+ENV PATH="/opt/hermes/.venv/bin:/opt/data/.local/bin:/opt/tools/bin:${PATH}"
+ENV PIPX_HOME=/opt/tools/pipx
+ENV PIPX_BIN_DIR=/opt/tools/bin
+ENV GOBIN=/opt/tools/bin
+ENV CARGO_INSTALL_ROOT=/opt/tools
+RUN mkdir -p /opt/data /opt/tools/bin
 VOLUME [ "/opt/data" ]
 
 # s6-overlay's /init is PID 1. It sets up the supervision tree, runs

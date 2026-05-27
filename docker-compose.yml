@@ -37,6 +37,19 @@ services:
     volumes:
       - ~/.hermes:/opt/data
       - ~/Obsidian/ilkor-personal:/opt/data/obsidian-vault:rw
+      # Persistent ad-hoc tools volume. Hermes installs single-binary /
+      # pipx / go install / cargo install tools here so they survive
+      # container recreates. See MEMORY.md for the rule, and Dockerfile
+      # ENV block for the PATH / PIPX_HOME / GOBIN / CARGO_INSTALL_ROOT
+      # wiring.
+      - ~/.hermes-tools:/opt/tools:rw
+      # Mini Apps catalog (proj. Mini Apps). Host clone at
+      # /srv/enotim_dev/mini-apps is served by Caddy at the secret-prefix
+      # URL on enotim.dev; mounting RW lets Hermes edit / commit / push
+      # apps from inside the container. Same path also lives in the
+      # VPS-side /srv/enotim_dev/docker-compose.yml as a RO mount into
+      # the caddy container.
+      - /srv/enotim_dev/mini-apps:/workspace/mini-apps:rw
     environment:
       - HERMES_UID=${HERMES_UID:-10000}
       - HERMES_GID=${HERMES_GID:-10000}
