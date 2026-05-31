@@ -303,6 +303,7 @@ class SlackAdapter(BasePlatformAdapter):
     """
 
     MAX_MESSAGE_LENGTH = 39000  # Slack API allows 40,000 chars; leave margin
+    MARKDOWN_BLOCK_TEXT_LIMIT = 12000  # Slack markdown block cumulative text limit
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.SLACK)
@@ -755,6 +756,67 @@ class SlackAdapter(BasePlatformAdapter):
             return self._team_clients[team_id]
         return self._app.client  # fallback to primary
 
+    def _use_markdown_blocks(self, chat_id: str) -> bool:
+        """Whether final Slack sends should use markdown blocks for this chat."""
+        raw_default = self.config.extra.get("markdown_blocks_default", False)
+        if isinstance(raw_default, str):
+            default_enabled = raw_default.strip().lower() in {"1", "true", "yes", "on"}
+        else:
+            default_enabled = bool(raw_default)
+        if default_enabled:
+            return True
+
+        raw_channels = self.config.extra.get("markdown_blocks_channels") or []
+        if isinstance(raw_channels, str):
+            channels = {part.strip() for part in raw_channels.split(",") if part.strip()}
+        else:
+            channels = {str(part).strip() for part in raw_channels if str(part).strip()}
+        return chat_id in channels
+
+    async def _post_legacy_mrkdwn_chunks(
+        self,
+        chat_id: str,
+        chunks: List[str],
+        thread_ts: Optional[str],
+        broadcast: bool,
+    ) -> Any:
+        """Post already-formatted legacy mrkdwn chunks and return the last result."""
+        last_result = None
+        for i, chunk in enumerate(chunks):
+            kwargs = {
+                "channel": chat_id,
+                "text": chunk,
+                "mrkdwn": True,
+            }
+            if thread_ts:
+                kwargs["thread_ts"] = thread_ts
+                # Only broadcast the first chunk of the first reply.
+                if broadcast and i == 0:
+                    kwargs["reply_broadcast"] = True
+
+            last_result = await self._get_client(chat_id).chat_postMessage(**kwargs)
+        return last_result
+
+    async def _post_markdown_block(
+        self,
+        chat_id: str,
+        content: str,
+        fallback_text: str,
+        thread_ts: Optional[str],
+        broadcast: bool,
+    ) -> Any:
+        """Post one Slack markdown block. V1 intentionally does not chunk blocks."""
+        kwargs = {
+            "channel": chat_id,
+            "text": fallback_text,
+            "blocks": [{"type": "markdown", "text": content}],
+        }
+        if thread_ts:
+            kwargs["thread_ts"] = thread_ts
+            if broadcast:
+                kwargs["reply_broadcast"] = True
+        return await self._get_client(chat_id).chat_postMessage(**kwargs)
+
     async def send(
         self,
         chat_id: str,
@@ -791,19 +853,32 @@ class SlackAdapter(BasePlatformAdapter):
             # Controlled via platform config: gateway.slack.reply_broadcast
             broadcast = self.config.extra.get("reply_broadcast", False)
 
-            for i, chunk in enumerate(chunks):
-                kwargs = {
-                    "channel": chat_id,
-                    "text": chunk,
-                    "mrkdwn": True,
-                }
-                if thread_ts:
-                    kwargs["thread_ts"] = thread_ts
-                    # Only broadcast the first chunk of the first reply
-                    if broadcast and i == 0:
-                        kwargs["reply_broadcast"] = True
-
-                last_result = await self._get_client(chat_id).chat_postMessage(**kwargs)
+            if (
+                content
+                and self._use_markdown_blocks(chat_id)
+                and len(content) <= self.MARKDOWN_BLOCK_TEXT_LIMIT
+            ):
+                try:
+                    last_result = await self._post_markdown_block(
+                        chat_id,
+                        content,
+                        formatted or content,
+                        thread_ts,
+                        broadcast,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[Slack] Markdown block send failed; falling back to legacy mrkdwn: %s",
+                        e,
+                        exc_info=True,
+                    )
+                    last_result = await self._post_legacy_mrkdwn_chunks(
+                        chat_id, chunks, thread_ts, broadcast,
+                    )
+            else:
+                last_result = await self._post_legacy_mrkdwn_chunks(
+                    chat_id, chunks, thread_ts, broadcast,
+                )
 
             # Clear Slack Assistant status as soon as the final message is posted.
             if thread_ts:
