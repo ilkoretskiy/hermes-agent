@@ -23,6 +23,7 @@ from gateway.platforms.base import (
     SUPPORTED_DOCUMENT_TYPES,
     is_host_excluded_by_no_proxy,
 )
+from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
 
 
 # ---------------------------------------------------------------------------
@@ -2474,6 +2475,176 @@ class TestMessageSplitting:
         await adapter.send("C123", "See [Foo](https://en.wikipedia.org/wiki/Foo_(bar))")
         kwargs = adapter._app.client.chat_postMessage.call_args.kwargs
         assert "<https://en.wikipedia.org/wiki/Foo_(bar)|Foo>" in kwargs["text"]
+
+
+class TestSlackMarkdownBlocks:
+    """Slack markdown-block rollout behavior for final sends."""
+
+    @pytest.mark.asyncio
+    async def test_allowlisted_channel_sends_markdown_block(self, adapter):
+        adapter.config.extra["markdown_blocks_channels"] = ["C123"]
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "ts1"})
+
+        await adapter.send("C123", "## Title\n\n**bold** [link](https://example.com)")
+
+        kwargs = adapter._app.client.chat_postMessage.call_args.kwargs
+        assert kwargs["blocks"] == [
+            {
+                "type": "markdown",
+                "text": "## Title\n\n**bold** [link](https://example.com)",
+            }
+        ]
+        assert kwargs["text"]
+        assert "mrkdwn" not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_non_allowlisted_channel_keeps_legacy_mrkdwn(self, adapter):
+        adapter.config.extra["markdown_blocks_channels"] = ["C_ALLOWED"]
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "ts1"})
+
+        await adapter.send("C123", "## Title\n\n**bold**")
+
+        kwargs = adapter._app.client.chat_postMessage.call_args.kwargs
+        assert "blocks" not in kwargs
+        assert kwargs["text"].startswith("*Title*")
+        assert "*bold*" in kwargs["text"]
+        assert kwargs["mrkdwn"] is True
+
+    @pytest.mark.asyncio
+    async def test_markdown_blocks_default_enables_all_channels(self, adapter):
+        adapter.config.extra["markdown_blocks_default"] = True
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "ts1"})
+
+        await adapter.send("C123", "# Default markdown")
+
+        kwargs = adapter._app.client.chat_postMessage.call_args.kwargs
+        assert kwargs["blocks"] == [
+            {"type": "markdown", "text": "# Default markdown"}
+        ]
+        assert "mrkdwn" not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_markdown_block_failure_falls_back_to_legacy_mrkdwn(self, adapter):
+        adapter.config.extra["markdown_blocks_channels"] = ["C123"]
+        adapter._app.client.chat_postMessage = AsyncMock(
+            side_effect=[RuntimeError("invalid_blocks"), {"ts": "ts2"}]
+        )
+
+        result = await adapter.send("C123", "## Title\n\n**bold**")
+
+        assert result.success is True
+        assert adapter._app.client.chat_postMessage.call_count == 2
+        first_kwargs = adapter._app.client.chat_postMessage.call_args_list[0].kwargs
+        second_kwargs = adapter._app.client.chat_postMessage.call_args_list[1].kwargs
+        assert "blocks" in first_kwargs
+        assert "blocks" not in second_kwargs
+        assert second_kwargs["text"].startswith("*Title*")
+        assert "*bold*" in second_kwargs["text"]
+        assert second_kwargs["mrkdwn"] is True
+
+    @pytest.mark.asyncio
+    async def test_stream_overflow_finalizes_each_chunk_with_markdown_blocks(self, adapter):
+        adapter.config.extra["markdown_blocks_channels"] = ["C123"]
+        adapter.MARKDOWN_BLOCK_TEXT_LIMIT = 700
+        adapter._app.client.chat_update = AsyncMock(return_value={"ok": True})
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "ts2"})
+
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "C123",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5, cursor=""),
+        )
+        consumer._message_id = "ts1"
+        consumer._already_sent = True
+        consumer._last_sent_text = "preview"
+
+        consumer.on_delta("## Title\n\n" + ("x" * 1080))
+        consumer.finish()
+
+        await consumer.run()
+
+        update_kwargs = adapter._app.client.chat_update.call_args.kwargs
+        post_kwargs = adapter._app.client.chat_postMessage.call_args.kwargs
+        assert update_kwargs["blocks"][0]["type"] == "markdown"
+        assert len(update_kwargs["blocks"][0]["text"]) <= adapter.MARKDOWN_BLOCK_TEXT_LIMIT
+        assert "mrkdwn" not in update_kwargs
+        assert post_kwargs["blocks"][0]["type"] == "markdown"
+        assert len(post_kwargs["blocks"][0]["text"]) <= adapter.MARKDOWN_BLOCK_TEXT_LIMIT
+        assert "mrkdwn" not in post_kwargs
+
+    @pytest.mark.asyncio
+    async def test_allowlisted_long_reply_bypasses_markdown_blocks(self, adapter):
+        adapter.config.extra["markdown_blocks_channels"] = ["C123"]
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "ts1"})
+        long_reply = "# Title\n\n" + ("x" * 12001)
+
+        await adapter.send("C123", long_reply)
+
+        kwargs = adapter._app.client.chat_postMessage.call_args.kwargs
+        assert "blocks" not in kwargs
+        assert kwargs["text"].startswith("*Title*")
+        assert kwargs["mrkdwn"] is True
+
+    @pytest.mark.asyncio
+    async def test_intermediate_edit_remains_legacy_when_markdown_blocks_enabled(self, adapter):
+        adapter.config.extra["markdown_blocks_default"] = True
+        adapter._app.client.chat_update = AsyncMock(return_value={"ok": True})
+
+        await adapter.edit_message(
+            "C123",
+            "1234.5678",
+            "## Title\n\n**bold**",
+            finalize=False,
+        )
+
+        kwargs = adapter._app.client.chat_update.call_args.kwargs
+        assert "blocks" not in kwargs
+        assert kwargs["text"].startswith("*Title*")
+        assert "*bold*" in kwargs["text"]
+
+    @pytest.mark.asyncio
+    async def test_final_edit_sends_markdown_block_when_enabled(self, adapter):
+        adapter.config.extra["markdown_blocks_channels"] = ["C123"]
+        adapter._app.client.chat_update = AsyncMock(return_value={"ok": True})
+
+        await adapter.edit_message(
+            "C123",
+            "1234.5678",
+            "## Title\n\n| A | B |\n|---|---|\n| 1 | 2 |",
+            finalize=True,
+        )
+
+        kwargs = adapter._app.client.chat_update.call_args.kwargs
+        assert kwargs["blocks"] == [
+            {
+                "type": "markdown",
+                "text": "## Title\n\n| A | B |\n|---|---|\n| 1 | 2 |",
+            }
+        ]
+        assert kwargs["text"].startswith("*Title*")
+
+    @pytest.mark.asyncio
+    async def test_final_edit_markdown_block_failure_falls_back_to_text(self, adapter):
+        adapter.config.extra["markdown_blocks_channels"] = ["C123"]
+        adapter._app.client.chat_update = AsyncMock(
+            side_effect=[RuntimeError("invalid_blocks"), {"ok": True}]
+        )
+
+        result = await adapter.edit_message(
+            "C123",
+            "1234.5678",
+            "## Title\n\n**bold**",
+            finalize=True,
+        )
+
+        assert result.success is True
+        assert adapter._app.client.chat_update.call_count == 2
+        first_kwargs = adapter._app.client.chat_update.call_args_list[0].kwargs
+        second_kwargs = adapter._app.client.chat_update.call_args_list[1].kwargs
+        assert "blocks" in first_kwargs
+        assert "blocks" not in second_kwargs
+        assert second_kwargs["text"].startswith("*Title*")
+        assert "*bold*" in second_kwargs["text"]
 
 
 # ---------------------------------------------------------------------------

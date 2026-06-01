@@ -405,7 +405,7 @@ class GatewayStreamConsumer:
             if isinstance(self.adapter, _BasePlatformAdapter)
             else len
         )
-        _raw_limit = getattr(self.adapter, "MAX_MESSAGE_LENGTH", 4096)
+        _raw_limit = self._stream_message_limit()
         _safe_limit = max(500, _raw_limit - _len_fn(self.cfg.cursor) - 100)
 
         # Resolve native draft streaming once per run.  When enabled the
@@ -523,7 +523,7 @@ class GatewayStreamConsumer:
                         if split_at < _safe_limit // 2:
                             split_at = _safe_limit
                         chunk = self._accumulated[:split_at]
-                        ok = await self._send_or_edit(chunk)
+                        ok = await self._send_or_edit(chunk, finalize=True)
                         if self._fallback_final_send or not ok:
                             # Edit failed (or backed off due to flood control)
                             # while attempting to split an oversized message.
@@ -669,6 +669,17 @@ class GatewayStreamConsumer:
         # Strip trailing whitespace/newlines but preserve leading content
         return cleaned.rstrip()
 
+    def _stream_message_limit(self) -> int:
+        limit_fn = getattr(self.adapter, "stream_message_limit", None)
+        if callable(limit_fn):
+            try:
+                limit = int(limit_fn(self.chat_id))
+                if limit > 0:
+                    return limit
+            except Exception:
+                logger.debug("stream_message_limit lookup failed", exc_info=True)
+        return getattr(self.adapter, "MAX_MESSAGE_LENGTH", 4096)
+
     async def _send_new_chunk(self, text: str, reply_to_id: Optional[str]) -> Optional[str]:
         """Send a new message chunk, optionally threaded to a previous message.
 
@@ -780,7 +791,7 @@ class GatewayStreamConsumer:
                 self._final_response_sent = True
                 return
 
-        raw_limit = getattr(self.adapter, "MAX_MESSAGE_LENGTH", 4096)
+        raw_limit = self._stream_message_limit()
         _len_fn: "Callable[[str], int]" = (
             self.adapter.message_len_fn
             if isinstance(self.adapter, _BasePlatformAdapter)
