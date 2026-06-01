@@ -773,6 +773,12 @@ class SlackAdapter(BasePlatformAdapter):
             channels = {str(part).strip() for part in raw_channels if str(part).strip()}
         return chat_id in channels
 
+    def stream_message_limit(self, chat_id: str) -> int:
+        """Return the streaming chunk limit for this Slack chat."""
+        if self._use_markdown_blocks(chat_id):
+            return min(self.MAX_MESSAGE_LENGTH, self.MARKDOWN_BLOCK_TEXT_LIMIT)
+        return self.MAX_MESSAGE_LENGTH
+
     async def _post_legacy_mrkdwn_chunks(
         self,
         chat_id: str,

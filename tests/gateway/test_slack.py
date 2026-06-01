@@ -23,6 +23,7 @@ from gateway.platforms.base import (
     SUPPORTED_DOCUMENT_TYPES,
     is_host_excluded_by_no_proxy,
 )
+from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
 
 
 # ---------------------------------------------------------------------------
@@ -2540,6 +2541,36 @@ class TestSlackMarkdownBlocks:
         assert second_kwargs["text"].startswith("*Title*")
         assert "*bold*" in second_kwargs["text"]
         assert second_kwargs["mrkdwn"] is True
+
+    @pytest.mark.asyncio
+    async def test_stream_overflow_finalizes_each_chunk_with_markdown_blocks(self, adapter):
+        adapter.config.extra["markdown_blocks_channels"] = ["C123"]
+        adapter.MARKDOWN_BLOCK_TEXT_LIMIT = 700
+        adapter._app.client.chat_update = AsyncMock(return_value={"ok": True})
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "ts2"})
+
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "C123",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5, cursor=""),
+        )
+        consumer._message_id = "ts1"
+        consumer._already_sent = True
+        consumer._last_sent_text = "preview"
+
+        consumer.on_delta("## Title\n\n" + ("x" * 1080))
+        consumer.finish()
+
+        await consumer.run()
+
+        update_kwargs = adapter._app.client.chat_update.call_args.kwargs
+        post_kwargs = adapter._app.client.chat_postMessage.call_args.kwargs
+        assert update_kwargs["blocks"][0]["type"] == "markdown"
+        assert len(update_kwargs["blocks"][0]["text"]) <= adapter.MARKDOWN_BLOCK_TEXT_LIMIT
+        assert "mrkdwn" not in update_kwargs
+        assert post_kwargs["blocks"][0]["type"] == "markdown"
+        assert len(post_kwargs["blocks"][0]["text"]) <= adapter.MARKDOWN_BLOCK_TEXT_LIMIT
+        assert "mrkdwn" not in post_kwargs
 
     @pytest.mark.asyncio
     async def test_allowlisted_long_reply_bypasses_markdown_blocks(self, adapter):
