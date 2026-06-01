@@ -2555,16 +2555,65 @@ class TestSlackMarkdownBlocks:
         assert kwargs["mrkdwn"] is True
 
     @pytest.mark.asyncio
-    async def test_edit_message_remains_legacy_when_markdown_blocks_enabled(self, adapter):
+    async def test_intermediate_edit_remains_legacy_when_markdown_blocks_enabled(self, adapter):
         adapter.config.extra["markdown_blocks_default"] = True
         adapter._app.client.chat_update = AsyncMock(return_value={"ok": True})
 
-        await adapter.edit_message("C123", "1234.5678", "## Title\n\n**bold**")
+        await adapter.edit_message(
+            "C123",
+            "1234.5678",
+            "## Title\n\n**bold**",
+            finalize=False,
+        )
 
         kwargs = adapter._app.client.chat_update.call_args.kwargs
         assert "blocks" not in kwargs
         assert kwargs["text"].startswith("*Title*")
         assert "*bold*" in kwargs["text"]
+
+    @pytest.mark.asyncio
+    async def test_final_edit_sends_markdown_block_when_enabled(self, adapter):
+        adapter.config.extra["markdown_blocks_channels"] = ["C123"]
+        adapter._app.client.chat_update = AsyncMock(return_value={"ok": True})
+
+        await adapter.edit_message(
+            "C123",
+            "1234.5678",
+            "## Title\n\n| A | B |\n|---|---|\n| 1 | 2 |",
+            finalize=True,
+        )
+
+        kwargs = adapter._app.client.chat_update.call_args.kwargs
+        assert kwargs["blocks"] == [
+            {
+                "type": "markdown",
+                "text": "## Title\n\n| A | B |\n|---|---|\n| 1 | 2 |",
+            }
+        ]
+        assert kwargs["text"].startswith("*Title*")
+
+    @pytest.mark.asyncio
+    async def test_final_edit_markdown_block_failure_falls_back_to_text(self, adapter):
+        adapter.config.extra["markdown_blocks_channels"] = ["C123"]
+        adapter._app.client.chat_update = AsyncMock(
+            side_effect=[RuntimeError("invalid_blocks"), {"ok": True}]
+        )
+
+        result = await adapter.edit_message(
+            "C123",
+            "1234.5678",
+            "## Title\n\n**bold**",
+            finalize=True,
+        )
+
+        assert result.success is True
+        assert adapter._app.client.chat_update.call_count == 2
+        first_kwargs = adapter._app.client.chat_update.call_args_list[0].kwargs
+        second_kwargs = adapter._app.client.chat_update.call_args_list[1].kwargs
+        assert "blocks" in first_kwargs
+        assert "blocks" not in second_kwargs
+        assert second_kwargs["text"].startswith("*Title*")
+        assert "*bold*" in second_kwargs["text"]
 
 
 # ---------------------------------------------------------------------------

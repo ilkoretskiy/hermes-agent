@@ -956,11 +956,31 @@ class SlackAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
         try:
             formatted = self.format_message(content)
-            await self._get_client(chat_id).chat_update(
-                channel=chat_id,
-                ts=message_id,
-                text=formatted,
-            )
+            kwargs = {
+                "channel": chat_id,
+                "ts": message_id,
+                "text": formatted,
+            }
+            if (
+                finalize
+                and content
+                and self._use_markdown_blocks(chat_id)
+                and len(content) <= self.MARKDOWN_BLOCK_TEXT_LIMIT
+            ):
+                kwargs["blocks"] = [{"type": "markdown", "text": content}]
+
+            try:
+                await self._get_client(chat_id).chat_update(**kwargs)
+            except Exception as e:
+                if "blocks" not in kwargs:
+                    raise
+                logger.warning(
+                    "[Slack] Markdown block update failed; falling back to legacy text update: %s",
+                    e,
+                    exc_info=True,
+                )
+                kwargs.pop("blocks", None)
+                await self._get_client(chat_id).chat_update(**kwargs)
             if finalize:
                 await self.stop_typing(chat_id)
             return SendResult(success=True, message_id=message_id)
