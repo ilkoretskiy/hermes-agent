@@ -35,6 +35,24 @@ log = logging.getLogger(__name__)
 # `docker restart` cycles.
 _AUTOSTART_STATES = frozenset({"running"})
 
+_ENV_TRUE = frozenset({"1", "true", "yes"})
+
+
+def _env_flag(name: str) -> bool:
+    """True when env var ``name`` is set to a truthy token (1/true/yes)."""
+    return os.environ.get(name, "").strip().lower() in _ENV_TRUE
+
+
+def _parse_managed_profiles(raw: str) -> set[str] | None:
+    """Parse ``HERMES_GATEWAY_MANAGED_PROFILES`` into an allowlist set.
+
+    Returns ``None`` when unset/empty (meaning "manage all profiles" —
+    the single-container default). Otherwise a set of profile names;
+    comma-separated, whitespace-trimmed, blanks dropped.
+    """
+    names = {p.strip() for p in raw.split(",") if p.strip()}
+    return names or None
+
 # Stale runtime files we sweep before recreating service slots. These
 # all hold container-namespaced state (PIDs, process tables) that's
 # garbage post-restart — a numerically-equal PID in the new container
@@ -89,7 +107,38 @@ def reconcile_profile_gateways(
     Returns:
         One :class:`ReconcileAction` per profile, in this order:
         ``default`` first, then named profiles in directory order.
+
+    Multi-container deployments share one ``$HERMES_HOME`` volume, so
+    every container's reconciler sees every profile dir. Two env knobs
+    keep them from fighting over the same s6 slots / log lockfiles:
+
+    * ``HERMES_GATEWAY_RECONCILE_DISABLED`` (1/true/yes) — skip the whole
+      pass; register nothing, not even the ``default`` slot. For
+      containers whose only job is a single CMD gateway or a dashboard:
+      they must not register/supervise any profile gateway over the
+      shared volume, or their s6-log loggers collide with the
+      supervising container's on the same lockfiles ("Resource busy"
+      spam). Distinct from the narrow ``--no-supervise`` /
+      ``HERMES_GATEWAY_NO_SUPERVISE`` opt-out, which only suppresses
+      legacy default-state seeding but still registers slots.
+    * ``HERMES_GATEWAY_MANAGED_PROFILES`` — comma-separated allowlist of
+      named profiles this container may register. When set, named
+      profiles outside the list are skipped (the ``default`` slot is
+      always registered as the bare-``gateway start`` landing pad). For
+      the container that supervises secondaries: list only the ones it
+      owns, so it never grabs a profile another container runs as CMD.
     """
+    if _env_flag("HERMES_GATEWAY_RECONCILE_DISABLED"):
+        log.info(
+            "HERMES_GATEWAY_RECONCILE_DISABLED set — skipping profile "
+            "gateway reconciliation (this container supervises no profiles)",
+        )
+        return []
+
+    managed = _parse_managed_profiles(
+        os.environ.get("HERMES_GATEWAY_MANAGED_PROFILES", ""),
+    )
+
     actions: list[ReconcileAction] = []
 
     # Default profile — always register, even if nothing has ever
@@ -139,6 +188,14 @@ def reconcile_profile_gateways(
                 )
                 continue
 
+            # Multi-container allowlist: only register profiles this
+            # container owns. Others run as another container's CMD (or
+            # under another supervisor) over the shared volume — grabbing
+            # them here would double-start the bot and fight for its
+            # Telegram token-lock / s6 log lockfiles.
+            if managed is not None and entry.name not in managed:
+                continue
+
             prior_state = _read_prior_state(entry)
             should_start = prior_state in _AUTOSTART_STATES
 
@@ -177,7 +234,7 @@ def _maybe_migrate_legacy_gateway_run_state(
     if state_file.exists():
         return None
 
-    if os.environ.get("HERMES_GATEWAY_NO_SUPERVISE", "").lower() in ("1", "true", "yes"):
+    if _env_flag("HERMES_GATEWAY_NO_SUPERVISE"):
         return None
 
     argv = tuple(container_argv) if container_argv is not None else _read_container_argv()

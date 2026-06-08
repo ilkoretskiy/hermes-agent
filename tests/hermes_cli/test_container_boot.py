@@ -663,3 +663,94 @@ def test_profiles_default_subdir_is_skipped_with_warning(
     assert any(
         "profiles/default/" in record.message for record in caplog.records
     )
+
+
+# ---------------------------------------------------------------------------
+# Multi-container env knobs: RECONCILE_DISABLED / MANAGED_PROFILES
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("value", ["1", "true", "yes", "TRUE", "Yes"])
+def test_reconcile_disabled_skips_all_reconciliation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    """A RECONCILE_DISABLED container registers nothing — not even the
+    default slot — so it can't spawn duplicate s6 loggers over a shared
+    volume. Distinct from the narrow --no-supervise opt-out."""
+    monkeypatch.setenv("HERMES_GATEWAY_RECONCILE_DISABLED", value)
+    scandir = tmp_path / "run-service"; scandir.mkdir()
+    _make_profile(tmp_path, "coder", state="running")
+    _seed_default_root(tmp_path, state="running")
+
+    actions = reconcile_profile_gateways(
+        hermes_home=tmp_path, scandir=scandir, dry_run=False,
+    )
+
+    assert actions == []
+    # No service slots created at all.
+    assert list(scandir.iterdir()) == []
+
+
+def test_managed_profiles_allowlist_skips_unlisted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With an allowlist, only listed named profiles are registered;
+    others (run as another container's CMD) are left alone. The default
+    slot is always registered regardless."""
+    monkeypatch.setenv("HERMES_GATEWAY_MANAGED_PROFILES", "inbox")
+    scandir = tmp_path / "run-service"; scandir.mkdir()
+    _make_profile(tmp_path, "inbox", state="running")
+    _make_profile(tmp_path, "family", state="running")
+
+    actions = reconcile_profile_gateways(
+        hermes_home=tmp_path, scandir=scandir, dry_run=False,
+    )
+
+    assert _named_actions(actions) == [ReconcileAction(
+        profile="inbox", prior_state="running", action="started",
+    )]
+    assert (scandir / "gateway-inbox").is_dir()
+    assert not (scandir / "gateway-family").exists()
+    # Default slot still registered as the bare-`gateway start` landing pad.
+    assert (scandir / "gateway-default").is_dir()
+
+
+def test_managed_profiles_accepts_whitespace_and_blanks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Allowlist parsing trims whitespace and ignores empty entries."""
+    monkeypatch.setenv("HERMES_GATEWAY_MANAGED_PROFILES", " inbox , , main ")
+    scandir = tmp_path / "run-service"; scandir.mkdir()
+    _make_profile(tmp_path, "inbox", state="stopped")
+    _make_profile(tmp_path, "main", state="running")
+    _make_profile(tmp_path, "family", state="running")
+
+    actions = reconcile_profile_gateways(
+        hermes_home=tmp_path, scandir=scandir, dry_run=False,
+    )
+
+    names = {a.profile for a in _named_actions(actions)}
+    assert names == {"inbox", "main"}
+
+
+def test_empty_managed_profiles_manages_all(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty/whitespace allowlist means single-container default:
+    manage every profile (None sentinel, not an empty set)."""
+    monkeypatch.setenv("HERMES_GATEWAY_MANAGED_PROFILES", "   ")
+    scandir = tmp_path / "run-service"; scandir.mkdir()
+    _make_profile(tmp_path, "inbox", state="running")
+    _make_profile(tmp_path, "family", state="running")
+
+    actions = reconcile_profile_gateways(
+        hermes_home=tmp_path, scandir=scandir, dry_run=False,
+    )
+
+    names = {a.profile for a in _named_actions(actions)}
+    assert names == {"inbox", "family"}
