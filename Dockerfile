@@ -49,9 +49,9 @@ RUN install -d -m 0755 /etc/apt/keyrings && \
 # Fork-only: install `bd` (beads, issue tracker for coding agents). Single
 # statically-linked Go binary — no apt deps. Keeping bd in the image (not in
 # the persistent tools volume) so a fresh container always has it.
-# https://github.com/steveyegge/beads
+# https://github.com/gastownhall/beads
 ARG BD_VERSION=1.0.4
-RUN curl -fsSL "https://github.com/steveyegge/beads/releases/download/v${BD_VERSION}/beads_${BD_VERSION}_linux_amd64.tar.gz" \
+RUN curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors "https://github.com/gastownhall/beads/releases/download/v${BD_VERSION}/beads_${BD_VERSION}_linux_amd64.tar.gz" \
       | tar -xz -C /usr/local/bin bd \
     && bd --version
 
