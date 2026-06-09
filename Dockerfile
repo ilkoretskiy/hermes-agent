@@ -232,6 +232,9 @@ RUN chmod -R a+rX /opt/hermes && \
 # this a fast (~1s) egg-link creation with no resolution or downloads.
 RUN uv pip install --no-cache-dir --no-deps -e "."
 
+# ---------- Mnemosyne memory provider (baked: pip into .venv is lost on recreate; see hindsight note above) ----------
+RUN uv pip install --no-cache-dir "mnemosyne-memory[embeddings]==3.4.0" "mnemosyne-hermes==0.1.5"
+
 # ---------- Bake build-time git revision ----------
 # .dockerignore excludes .git, so `git rev-parse HEAD` from inside the
 # container always returns nothing — meaning `hermes dump` reports
