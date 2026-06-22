@@ -42,11 +42,18 @@ def adapter():
 
 
 @pytest.fixture(autouse=True)
-def _redirect_cache(tmp_path, monkeypatch):
+def _isolate_slack_scope_tests(tmp_path, monkeypatch):
     """Point document cache to tmp_path so tests don't touch ~/.hermes."""
     monkeypatch.setattr(
         "gateway.platforms.base.DOCUMENT_CACHE_DIR", tmp_path / "doc_cache"
     )
+    for name in (
+        "SLACK_ALLOWED_CHANNELS",
+        "SLACK_FREE_RESPONSE_CHANNELS",
+        "SLACK_REQUIRE_MENTION",
+        "SLACK_STRICT_MENTION",
+    ):
+        monkeypatch.delenv(name, raising=False)
 
 
 def _channel_event(text: str, ts: str, thread_ts: str = None) -> dict:
