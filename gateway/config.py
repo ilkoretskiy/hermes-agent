@@ -1016,6 +1016,8 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["markdown_blocks_channels"] = platform_cfg["markdown_blocks_channels"]
                 if plat == Platform.SLACK and "markdown_blocks_default" in platform_cfg:
                     bridged["markdown_blocks_default"] = platform_cfg["markdown_blocks_default"]
+                if plat == Platform.SLACK and "thread_routing" in platform_cfg:
+                    bridged["thread_routing"] = platform_cfg["thread_routing"]
                 if "channel_prompts" in platform_cfg:
                     channel_prompts = platform_cfg["channel_prompts"]
                     if isinstance(channel_prompts, dict):
