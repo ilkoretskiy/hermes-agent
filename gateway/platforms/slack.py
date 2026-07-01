@@ -352,6 +352,12 @@ class SlackAdapter(BasePlatformAdapter):
         # respond to ALL subsequent messages in that thread automatically.
         self._mentioned_threads: set = set()
         self._MENTIONED_THREADS_MAX = 5000
+        # Per-thread strict routing state for user-requested "stop replying"
+        # controls.  The persisted JSON is read lazily so externally-created
+        # test fixtures and adapter restarts observe the same state file.
+        self._THREAD_ROUTING_STATE_MAX = 5000
+        self._slack_active_thread_keys: set[str] = set()
+        self._SLACK_ACTIVE_THREAD_KEYS_MAX = 5000
         # Assistant thread metadata keyed by (channel_id, thread_ts). Slack's
         # AI Assistant lifecycle events can arrive before/alongside message
         # events, and they carry the user/thread identity needed for stable
@@ -1271,6 +1277,11 @@ class SlackAdapter(BasePlatformAdapter):
                 # Also register the thread root so replies-to-my-replies work
                 if thread_ts:
                     self._bot_message_ts.add(thread_ts)
+                    self._mark_slack_thread_active(
+                        team_id=self._channel_team.get(chat_id, ""),
+                        channel_id=chat_id,
+                        thread_ts=thread_ts,
+                    )
                 if len(self._bot_message_ts) > self._BOT_TS_MAX:
                     excess = len(self._bot_message_ts) - self._BOT_TS_MAX // 2
                     for old_ts in list(self._bot_message_ts)[:excess]:
@@ -1643,6 +1654,11 @@ class SlackAdapter(BasePlatformAdapter):
         if not thread_ts:
             return
         self._bot_message_ts.add(thread_ts)
+        self._mark_slack_thread_active(
+            team_id=self._channel_team.get(chat_id, ""),
+            channel_id=chat_id,
+            thread_ts=thread_ts,
+        )
         if len(self._bot_message_ts) > self._BOT_TS_MAX:
             excess = len(self._bot_message_ts) - self._BOT_TS_MAX // 2
             for old_ts in list(self._bot_message_ts)[:excess]:
@@ -2597,6 +2613,73 @@ class SlackAdapter(BasePlatformAdapter):
                 )
                 return
 
+            thread_routing_enabled = self._slack_thread_routing_enabled()
+            control_thread_ts = thread_ts or event_thread_ts or ts
+            is_gateway_command = (original_text or "").startswith("/")
+            has_thread_session = False
+            if control_thread_ts:
+                has_thread_session = self._has_active_session_for_thread(
+                    channel_id=channel_id,
+                    thread_ts=control_thread_ts,
+                    user_id=user_id,
+                    team_id=team_id,
+                )
+            has_thread_routing_active_thread = (
+                self._has_scoped_active_slack_thread(
+                    team_id=team_id,
+                    channel_id=channel_id,
+                    thread_ts=control_thread_ts,
+                )
+                or has_thread_session
+            )
+
+            if thread_routing_enabled and control_thread_ts and not is_gateway_command:
+                # Suppress messages that address a different Slack user inside
+                # an active agent thread unless the bot is also explicitly
+                # mentioned.  This keeps the agent from jumping into
+                # human-to-human subthreads.
+                if (
+                    not is_mentioned
+                    and self._slack_thread_routing_config().get(
+                        "suppress_other_user_mentions", True
+                    )
+                    and has_thread_routing_active_thread
+                    and self._slack_text_mentions_other_user(routing_text, bot_uid)
+                ):
+                    return
+
+                stop_pattern = self._matches_slack_thread_control(routing_text, "stop")
+                resume_pattern = self._matches_slack_thread_control(
+                    routing_text, "resume"
+                )
+                is_thread_strict = self._is_slack_thread_strict(
+                    team_id=team_id,
+                    channel_id=channel_id,
+                    thread_ts=control_thread_ts,
+                )
+
+                if resume_pattern and is_mentioned:
+                    self._clear_slack_thread_strict(
+                        team_id=team_id,
+                        channel_id=channel_id,
+                        thread_ts=control_thread_ts,
+                    )
+                    is_thread_strict = False
+                elif stop_pattern and (is_mentioned or has_thread_routing_active_thread):
+                    self._set_slack_thread_strict(
+                        team_id=team_id,
+                        channel_id=channel_id,
+                        thread_ts=control_thread_ts,
+                        user_id=user_id,
+                        message_ts=ts,
+                        matched_pattern=stop_pattern,
+                    )
+                    return
+                elif stop_pattern:
+                    return
+                elif is_thread_strict and not is_mentioned:
+                    return
+
             if channel_id in self._slack_free_response_channels():
                 pass  # Free-response channel — always process
             elif not self._slack_require_mention():
@@ -2615,6 +2698,7 @@ class SlackAdapter(BasePlatformAdapter):
                     channel_id=channel_id,
                     thread_ts=event_thread_ts,
                     user_id=user_id,
+                    team_id=team_id,
                 )
                 if (
                     not reply_to_bot_thread
@@ -2645,6 +2729,7 @@ class SlackAdapter(BasePlatformAdapter):
             channel_id=channel_id,
             thread_ts=event_thread_ts,
             user_id=user_id,
+            team_id=team_id,
         ):
             thread_context = await self._fetch_thread_context(
                 channel_id=channel_id,
@@ -2895,6 +2980,7 @@ class SlackAdapter(BasePlatformAdapter):
             user_id=user_id,
             user_name=user_name,
             thread_id=thread_ts,
+            guild_id=team_id,
         )
 
         # Per-channel ephemeral prompt
@@ -2955,6 +3041,12 @@ class SlackAdapter(BasePlatformAdapter):
             self._reacting_message_ids.add(ts)
 
         await self.handle_message(msg_event)
+        if self._slack_thread_routing_enabled() and not is_dm:
+            self._mark_slack_thread_active(
+                team_id=team_id,
+                channel_id=channel_id,
+                thread_ts=thread_ts or event_thread_ts or ts,
+            )
 
     # ----- Approval button support (Block Kit) -----
 
@@ -3649,6 +3741,7 @@ class SlackAdapter(BasePlatformAdapter):
             chat_id=channel_id,
             chat_type="dm" if is_dm else "group",
             user_id=user_id,
+            guild_id=team_id,
         )
 
         event = MessageEvent(
@@ -3684,8 +3777,9 @@ class SlackAdapter(BasePlatformAdapter):
     def _has_active_session_for_thread(
         self,
         channel_id: str,
-        thread_ts: str,
+        thread_ts: Optional[str],
         user_id: str,
+        team_id: Optional[str] = None,
     ) -> bool:
         """Check if there's an active session for a thread.
 
@@ -3698,7 +3792,7 @@ class SlackAdapter(BasePlatformAdapter):
         settings correctly.
         """
         session_store = getattr(self, "_session_store", None)
-        if not session_store:
+        if not session_store or not thread_ts:
             return False
 
         try:
@@ -3710,6 +3804,7 @@ class SlackAdapter(BasePlatformAdapter):
                 chat_type="group",
                 user_id=user_id,
                 thread_id=thread_ts,
+                guild_id=team_id,
             )
 
             # Read session isolation settings from the store's config
@@ -3732,9 +3827,181 @@ class SlackAdapter(BasePlatformAdapter):
             )
 
             session_store._ensure_loaded()
-            return session_key in session_store._entries
+            entry = session_store._entries.get(session_key)
+            if not entry:
+                return False
+            if team_id is None:
+                return True
+
+            origin = getattr(entry, "origin", None)
+            origin_team_id = getattr(origin, "guild_id", None) if origin else None
+            return bool(origin_team_id) and origin_team_id == team_id
         except Exception:
             return False
+
+    # ── Per-thread strict routing controls ────────────────────────────────
+
+    def _slack_thread_routing_config(self) -> Dict[str, Any]:
+        raw = self.config.extra.get("thread_routing") or {}
+        return raw if isinstance(raw, dict) else {}
+
+    def _slack_thread_routing_enabled(self) -> bool:
+        cfg = self._slack_thread_routing_config()
+        enabled = cfg.get("enabled", False)
+        if isinstance(enabled, str):
+            return enabled.lower().strip() in {"true", "1", "yes", "on"}
+        return bool(enabled)
+
+    def _slack_thread_routing_state_path(self) -> _Path:
+        cfg = self._slack_thread_routing_config()
+        raw_path = str(cfg.get("state_file") or "slack/thread_routing_state.json")
+        path = _Path(raw_path).expanduser()
+        if path.is_absolute():
+            return path
+        try:
+            from hermes_constants import get_hermes_home
+
+            return get_hermes_home() / path
+        except Exception:  # pragma: no cover - defensive fallback
+            return _Path(os.environ.get("HERMES_HOME", _Path.home() / ".hermes")) / path
+
+    def _slack_thread_routing_key(
+        self, team_id: str, channel_id: str, thread_ts: str
+    ) -> str:
+        return f"{team_id}:{channel_id}:{thread_ts}"
+
+    def _mark_slack_thread_active(
+        self, *, team_id: str, channel_id: str, thread_ts: str
+    ) -> None:
+        if not team_id or not channel_id or not thread_ts:
+            return
+        self._slack_active_thread_keys.add(
+            self._slack_thread_routing_key(team_id, channel_id, thread_ts)
+        )
+        if len(self._slack_active_thread_keys) > self._SLACK_ACTIVE_THREAD_KEYS_MAX:
+            excess = len(self._slack_active_thread_keys) - self._SLACK_ACTIVE_THREAD_KEYS_MAX // 2
+            for old_key in list(self._slack_active_thread_keys)[:excess]:
+                self._slack_active_thread_keys.discard(old_key)
+
+    def _has_scoped_active_slack_thread(
+        self, *, team_id: str, channel_id: str, thread_ts: str
+    ) -> bool:
+        if not team_id or not channel_id or not thread_ts:
+            return False
+        return (
+            self._slack_thread_routing_key(team_id, channel_id, thread_ts)
+            in self._slack_active_thread_keys
+        )
+
+    def _load_slack_thread_routing_state(self) -> Dict[str, Any]:
+        path = self._slack_thread_routing_state_path()
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning(
+                "[Slack] Ignoring corrupt thread routing state at %s: %s",
+                path,
+                exc,
+            )
+            return {}
+        if not isinstance(data, dict):
+            logger.warning(
+                "[Slack] Ignoring invalid thread routing state at %s: expected object, got %s",
+                path,
+                type(data).__name__,
+            )
+            return {}
+        return data
+
+    def _write_slack_thread_routing_state(self, state: Dict[str, Any]) -> None:
+        path = self._slack_thread_routing_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
+        tmp_path.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        tmp_path.replace(path)
+
+    def _slack_thread_control_patterns(self, kind: str) -> List[str]:
+        cfg = self._slack_thread_routing_config()
+        raw = cfg.get(f"{kind}_patterns") or []
+        if isinstance(raw, str):
+            return [raw]
+        if isinstance(raw, list):
+            return [str(item) for item in raw if str(item).strip()]
+        return []
+
+    def _matches_slack_thread_control(self, text: str, kind: str) -> Optional[str]:
+        for pattern in self._slack_thread_control_patterns(kind):
+            try:
+                if re.search(pattern, text, flags=re.IGNORECASE):
+                    return pattern
+            except re.error as exc:
+                logger.warning(
+                    "[Slack] Ignoring invalid thread %s pattern %r: %s",
+                    kind,
+                    pattern,
+                    exc,
+                )
+        return None
+
+    def _set_slack_thread_strict(
+        self,
+        *,
+        team_id: str,
+        channel_id: str,
+        thread_ts: str,
+        user_id: str,
+        message_ts: str,
+        matched_pattern: str,
+    ) -> None:
+        state = self._load_slack_thread_routing_state()
+        key = self._slack_thread_routing_key(team_id, channel_id, thread_ts)
+        state[key] = {
+            "mode": "strict_mention",
+            "team_id": team_id,
+            "channel_id": channel_id,
+            "thread_ts": thread_ts,
+            "set_at": time.time(),
+            "set_by_user": user_id,
+            "set_by_message_ts": message_ts,
+            "matched_pattern": matched_pattern,
+        }
+        if len(state) > self._THREAD_ROUTING_STATE_MAX:
+            ordered = sorted(
+                state.items(),
+                key=lambda item: float(item[1].get("set_at", 0.0))
+                if isinstance(item[1], dict)
+                else 0.0,
+            )
+            for old_key, _ in ordered[: len(state) - self._THREAD_ROUTING_STATE_MAX]:
+                state.pop(old_key, None)
+        self._write_slack_thread_routing_state(state)
+
+    def _clear_slack_thread_strict(
+        self, *, team_id: str, channel_id: str, thread_ts: str
+    ) -> None:
+        state = self._load_slack_thread_routing_state()
+        key = self._slack_thread_routing_key(team_id, channel_id, thread_ts)
+        if key in state:
+            state.pop(key, None)
+            self._write_slack_thread_routing_state(state)
+
+    def _is_slack_thread_strict(
+        self, *, team_id: str, channel_id: str, thread_ts: str
+    ) -> bool:
+        state = self._load_slack_thread_routing_state()
+        value = state.get(self._slack_thread_routing_key(team_id, channel_id, thread_ts))
+        return isinstance(value, dict) and value.get("mode") == "strict_mention"
+
+    def _slack_text_mentions_other_user(self, text: str, bot_uid: Optional[str]) -> bool:
+        mentioned_users = set(re.findall(r"<@([A-Z0-9][A-Z0-9._-]*)>", text or ""))
+        if bot_uid:
+            mentioned_users.discard(bot_uid)
+        return bool(mentioned_users)
 
     async def _download_slack_file(
         self, url: str, ext: str, audio: bool = False, team_id: str = ""

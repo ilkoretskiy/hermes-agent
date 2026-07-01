@@ -2599,6 +2599,7 @@ class TestThreadReplyHandling:
         store._ensure_loaded = MagicMock()
         store.config = MagicMock()
         store.config.group_sessions_per_user = True
+        store.config.thread_sessions_per_user = True
         return store
 
     @pytest.fixture()
@@ -2641,7 +2642,9 @@ class TestThreadReplyHandling:
         """Thread replies without mention should be processed if there's an active session."""
         # Simulate an active session for this thread
         session_key = "agent:main:slack:group:C123:123.000:U_USER"
-        mock_session_store._entries = {session_key: MagicMock()}
+        entry = MagicMock()
+        entry.origin = MagicMock(guild_id="T_TEAM")
+        mock_session_store._entries = {session_key: entry}
 
         event = {
             "text": "Follow-up question",
@@ -2666,7 +2669,9 @@ class TestThreadReplyHandling:
         """Thread replies with @mention should still strip the bot ID."""
         # Even with a session, mentions should be stripped
         session_key = "agent:main:slack:group:C123:123.000:U_USER"
-        mock_session_store._entries = {session_key: MagicMock()}
+        entry = MagicMock()
+        entry.origin = MagicMock(guild_id="T_TEAM")
+        mock_session_store._entries = {session_key: entry}
 
         event = {
             "text": "<@U_BOT> thanks for the help",
