@@ -200,7 +200,9 @@ def set_active_session(adapter, *, team=TEAM_ID, channel=CHANNEL_ID, thread_ts=T
     """
     expected_thread_ts = thread_ts
 
-    def has_active_session(*, channel_id, thread_ts: str, user_id: str, team_id=None):
+    def has_active_session(
+        *, channel_id, thread_ts: str, user_id: str, team_id=None, chat_type="group"
+    ):
         return (
             (team_id is None or team_id == team)
             and channel_id == channel
@@ -590,6 +592,21 @@ class TestCommandGuard:
         set_active_session(adapter)
 
         await adapter._handle_slack_message(make_event("!stop responding"))
+
+        assert read_state(hermes_home) == {}
+        adapter.handle_message.assert_awaited_once()
+        msg_event = adapter.handle_message.await_args.args[0]
+        assert msg_event.text.startswith("/stop")
+
+    @pytest.mark.asyncio
+    async def test_mentioned_bang_stop_command_does_not_set_thread_strict_state(
+        self, adapter, hermes_home
+    ):
+        set_active_session(adapter)
+
+        await adapter._handle_slack_message(
+            make_event(f"<@{BOT_USER_ID}> !stop responding")
+        )
 
         assert read_state(hermes_home) == {}
         adapter.handle_message.assert_awaited_once()

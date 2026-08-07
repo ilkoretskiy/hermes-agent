@@ -12,6 +12,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from agent import secret_scope as ss
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
@@ -97,8 +98,7 @@ async def test_chat_completion_routes_requested_alias_to_backing_model(monkeypat
             )
 
     assert resp.status == 200
-    assert mock_run.call_args.kwargs["model_override"] == {
-        "alias": "hermes-dev-gpt",
+    assert mock_run.call_args.kwargs["route"] == {
         "model": "gpt-5.5",
         "provider": "openai",
         "api_key": "sk-openai",
@@ -160,8 +160,7 @@ async def test_responses_routes_requested_alias_to_backing_model(monkeypatch):
             )
 
     assert resp.status == 200
-    assert mock_run.call_args.kwargs["model_override"] == {
-        "alias": "hermes-dev-gemini",
+    assert mock_run.call_args.kwargs["route"] == {
         "model": "gemini-3-flash-preview",
         "provider": "gemini",
         "api_key": "sk-google",
@@ -199,8 +198,8 @@ async def test_chat_completion_streaming_routes_requested_alias(monkeypatch):
             await asyncio.sleep(0)
 
     assert resp.status == 200
-    assert mock_run.call_args.kwargs["model_override"]["model"] == "gpt-5.5"
-    assert mock_run.call_args.kwargs["model_override"]["api_key"] == "sk-openai"
+    assert mock_run.call_args.kwargs["route"]["model"] == "gpt-5.5"
+    assert mock_run.call_args.kwargs["route"]["api_key"] == "sk-openai"
     prompt = mock_run.call_args.kwargs["ephemeral_system_prompt"]
     assert "current requested alias is `hermes-dev-gpt`" in prompt
     assert "backing model is `gpt-5.5`" in prompt
@@ -236,8 +235,8 @@ async def test_responses_streaming_routes_requested_alias(monkeypatch):
             await asyncio.sleep(0)
 
     assert resp.status == 200
-    assert mock_run.call_args.kwargs["model_override"]["model"] == "gemini-3-flash-preview"
-    assert mock_run.call_args.kwargs["model_override"]["api_key"] == "sk-google"
+    assert mock_run.call_args.kwargs["route"]["model"] == "gemini-3-flash-preview"
+    assert mock_run.call_args.kwargs["route"]["api_key"] == "sk-google"
     prompt = mock_run.call_args.kwargs["ephemeral_system_prompt"]
     assert "current requested alias is `hermes-dev-gemini`" in prompt
     assert "backing model is `gemini-3-flash-preview`" in prompt
@@ -302,8 +301,8 @@ async def test_runs_routes_requested_alias(monkeypatch):
             assert status_resp.status == 200
             status = await status_resp.json()
 
-    assert mock_create.call_args.kwargs["model_override"]["model"] == "gpt-5.5"
-    assert mock_create.call_args.kwargs["model_override"]["api_key"] == "sk-openai"
+    assert mock_create.call_args.kwargs["route"]["model"] == "gpt-5.5"
+    assert mock_create.call_args.kwargs["route"]["api_key"] == "sk-openai"
     prompt = mock_create.call_args.kwargs["ephemeral_system_prompt"]
     assert "current requested alias is `hermes-dev-gpt`" in prompt
     assert "backing model is `gpt-5.5`" in prompt
@@ -378,7 +377,81 @@ async def test_missing_api_key_env_returns_model_misconfigured(monkeypatch):
     mock_run.assert_not_called()
 
 
-def test_create_agent_applies_model_override_without_primary_runtime_leaks(monkeypatch):
+def test_legacy_api_key_env_uses_active_profile_secret_scope(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "default-profile-key")
+    adapter = _adapter_with_models()
+    previous_multiplex = ss.is_multiplex_active()
+    ss.set_multiplex_active(True)
+    token = ss.set_secret_scope({"OPENAI_API_KEY": "worker-profile-key"})
+    try:
+        route = adapter._resolve_client_model_route("hermes-dev-gpt")
+    finally:
+        ss.reset_secret_scope(token)
+        ss.set_multiplex_active(previous_multiplex)
+
+    assert route is not None
+    assert route["api_key"] == "worker-profile-key"
+
+
+def test_explicit_model_routes_preserve_upstream_resolution_with_legacy_models():
+    adapter = APIServerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "model_name": "gateway-default",
+                "models": {
+                    "shared": {"provider": "openai", "model": "legacy-model"},
+                    "legacy-only": {
+                        "provider": "openai",
+                        "model": "legacy-only-model",
+                    },
+                },
+                "model_routes": {
+                    "shared": {"provider": "anthropic", "model": "explicit-model"},
+                },
+            },
+        )
+    )
+
+    assert adapter._resolve_client_model_route("gateway-default") is None
+    assert adapter._resolve_client_model_route("unconfigured-client-model") is None
+    assert adapter._resolve_client_model_route("shared") == {
+        "provider": "anthropic",
+        "model": "explicit-model",
+    }
+    assert adapter._resolve_client_model_route("legacy-only") == {
+        "provider": "openai",
+        "model": "legacy-only-model",
+        "base_url": None,
+        "api_mode": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_legacy_alias_matching_virtual_model_is_still_discoverable():
+    adapter = APIServerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "model_name": "same-name",
+                "models": {
+                    "same-name": {"provider": "openai", "model": "backing-model"},
+                },
+            },
+        )
+    )
+    app = _create_app(adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get("/v1/models")
+        assert resp.status == 200
+        data = await resp.json()
+
+    assert [item["id"] for item in data["data"]] == ["same-name"]
+    assert data["data"][0]["root"] == "same-name"
+
+
+def test_create_agent_applies_legacy_route_without_primary_runtime_leaks(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
     adapter = _adapter_with_models()
     primary_pool = object()
@@ -403,7 +476,7 @@ def test_create_agent_applies_model_override_without_primary_runtime_leaks(monke
     ):
         agent = adapter._create_agent(
             session_id="session-1",
-            model_override=adapter._resolve_model_override("hermes-dev-gpt"),
+            route=adapter._resolve_client_model_route("hermes-dev-gpt"),
         )
 
     assert agent is agent_instance
@@ -421,7 +494,10 @@ def test_create_agent_applies_model_override_without_primary_runtime_leaks(monke
 def test_routed_model_metadata_not_added_for_single_model_mode():
     adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"model_name": "dev"}))
 
-    assert adapter._append_routed_model_metadata("Existing prompt", None) == "Existing prompt"
+    assert (
+        adapter._append_legacy_route_metadata("Existing prompt", None, None)
+        == "Existing prompt"
+    )
 
 
 @pytest.mark.asyncio
