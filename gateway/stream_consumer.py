@@ -1446,12 +1446,11 @@ class GatewayStreamConsumer:
             if isinstance(self.adapter, _BasePlatformAdapter)
             else len
         )
-        # Per-chat resolution (relay adapter fronting N platforms): the cap and
-        # length unit follow the chat's underlying platform, not the adapter
-        # scalar. Native adapters return their scalar/property unchanged.
+        # _raw_message_limit() already resolves the per-chat cap and any richer
+        # streaming overflow limit. Resolve only the chat-specific length unit
+        # here so the final fallback uses that same canonical byte budget.
         if isinstance(self.adapter, _BasePlatformAdapter):
             try:
-                raw_limit = self.adapter.max_message_length_for_chat(self.chat_id)
                 _len_fn = self.adapter.message_len_fn_for_chat(self.chat_id)
             except Exception as e:
                 logger.debug("per-chat limit resolution failed: %s", e)
@@ -1872,14 +1871,6 @@ class GatewayStreamConsumer:
         # isinstance gate: MagicMock adapters return mock objects (truthy, not
         # ints) for arbitrary attribute access — keep them on the base limit.
         if isinstance(self.adapter, _BasePlatformAdapter):
-            limit_fn = getattr(self.adapter, "stream_message_limit", None)
-            if callable(limit_fn):
-                try:
-                    per_chat_limit = int(limit_fn(self.chat_id))
-                    if per_chat_limit > 0:
-                        return per_chat_limit
-                except Exception:
-                    logger.debug("stream_message_limit lookup failed", exc_info=True)
             try:
                 base = self.adapter.max_message_length_for_chat(self.chat_id)
             except Exception as e:

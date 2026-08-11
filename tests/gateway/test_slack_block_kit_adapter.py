@@ -175,7 +175,6 @@ class TestMarkdownBlockMode:
         # mrkdwn fallback text is still present for notifications/search
         assert kwargs["text"]
 
-
     @pytest.mark.asyncio
     async def test_edit_finalize_uses_markdown_block(self):
         adapter, client = _make_adapter({"markdown_blocks": True})
@@ -184,4 +183,38 @@ class TestMarkdownBlockMode:
         assert kwargs["blocks"][0]["type"] == "markdown"
         assert kwargs["blocks"][0]["text"] == RICH_TABLE_MD
 
+    @pytest.mark.asyncio
+    async def test_rejected_markdown_block_retries_send_without_blocks(self):
+        adapter, client = _make_adapter({"markdown_blocks": True})
+        client.chat_postMessage = AsyncMock(
+            side_effect=[SlackRejectedBlocks("invalid_blocks"), {"ts": "111.222"}]
+        )
 
+        result = await adapter.send(
+            "C1",
+            RICH_TABLE_MD,
+            metadata={"team_id": "T_SECONDARY"},
+        )
+
+        assert result.success is True
+        assert adapter._get_client.call_args_list == [
+            call("C1", team_id="T_SECONDARY"),
+            call("C1", team_id="T_SECONDARY"),
+        ]
+        assert client.chat_postMessage.await_count == 2
+        first = client.chat_postMessage.await_args_list[0].kwargs
+        second = client.chat_postMessage.await_args_list[1].kwargs
+        assert first["blocks"][0]["type"] == "markdown"
+        assert "blocks" not in second
+        assert second["text"]
+
+    @pytest.mark.asyncio
+    async def test_over_limit_markdown_falls_back_to_text(self):
+        adapter, client = _make_adapter({"markdown_blocks": True})
+        over_limit = "x" * (adapter._MARKDOWN_BLOCK_MAX + 1)
+
+        await adapter.send("C1", over_limit)
+
+        kwargs = client.chat_postMessage.await_args.kwargs
+        assert "blocks" not in kwargs
+        assert kwargs["text"] == over_limit

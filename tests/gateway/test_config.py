@@ -371,6 +371,26 @@ class TestLoadGatewayConfig:
             config.platforms[Platform.SLACK].typing_status_text == "chasing yarn…"
         )
 
+    def test_legacy_slack_markdown_keys_are_not_bridged(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "slack:\n"
+            "  require_mention: true\n"
+            "  markdown_blocks_default: true\n"
+            "  markdown_blocks_channels:\n"
+            "    - C0123456789\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        extra = config.platforms[Platform.SLACK].extra
+        assert extra["require_mention"] is True
+        assert "markdown_blocks_default" not in extra
+        assert "markdown_blocks_channels" not in extra
+
     def test_multiplex_profiles_from_nested_gateway_section(self, tmp_path, monkeypatch):
         """``gateway.multiplex_profiles: true`` (the nested form written by
         ``hermes config set gateway.multiplex_profiles true``) must enable

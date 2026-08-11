@@ -116,6 +116,7 @@ def smoke_adapter():
     adapter._app = MagicMock()
     adapter._app.client = AsyncMock()
     adapter._bot_user_id = BOT_USER_ID
+    adapter._team_clients = {TEAM_ID: adapter._app.client}
     adapter._team_bot_user_ids = {TEAM_ID: BOT_USER_ID}
     adapter._channel_team = {}
     adapter._running = True

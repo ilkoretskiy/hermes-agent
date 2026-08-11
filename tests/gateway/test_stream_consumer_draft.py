@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -349,7 +350,6 @@ class TestRichAwareOverflow:
     """Rich-capable adapters raise the consumer's overflow limit so a reply that
     fits one rich message isn't fragmented at the legacy 4,096 edit limit."""
 
-
     def test_raw_message_limit_mock_adapter_is_safe(self):
         # MagicMock adapters (many existing tests) must not crash or wrongly
         # inflate the limit from a truthy auto-attribute.
@@ -357,6 +357,29 @@ class TestRichAwareOverflow:
         adapter.MAX_MESSAGE_LENGTH = 4096
         consumer = GatewayStreamConsumer(adapter, "12345", StreamConsumerConfig())
         assert consumer._raw_message_limit() == 4096
+
+    def test_raw_message_limit_ignores_removed_ad_hoc_hook(self):
+        adapter = _make_rich_capable_adapter(overflow_limit=32_768)
+        setattr(adapter, "stream_message_limit", lambda chat_id: 11_500)
+        consumer = GatewayStreamConsumer(adapter, "12345", StreamConsumerConfig())
+
+        assert consumer._raw_message_limit() == 32_768
+
+    @pytest.mark.asyncio
+    async def test_fallback_final_uses_streaming_overflow_limit(self):
+        long_text = "x" * 5000  # > 4096 base limit, < 32768 rich limit
+        adapter = _make_rich_capable_adapter(overflow_limit=32_768)
+        send_mock = cast(AsyncMock, adapter.send)
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "12345",
+            StreamConsumerConfig(cursor=""),
+        )
+
+        await consumer._send_fallback_final(long_text)
+
+        send_mock.assert_awaited_once()
+        assert send_mock.await_args_list[0].kwargs["content"] == long_text
 
     @pytest.mark.asyncio
     async def test_long_rich_reply_not_split_and_final_is_whole(self):
@@ -388,4 +411,3 @@ class TestRichAwareOverflow:
         adapter.edit_message.assert_not_called()
         adapter.delete_message.assert_awaited_once_with("12345", "preview1")
         assert consumer.final_response_sent is True
-

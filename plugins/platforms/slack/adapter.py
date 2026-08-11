@@ -61,8 +61,28 @@ from gateway.platforms.base import (
 
 try:  # sibling module; support both package and flat plugin-dir import
     from .block_kit import render_blocks, sanitize_blocks
+    from .thread_routing import (
+        RoutingContext,
+        RoutingDisposition,
+        ThreadRoutingPolicy,
+        compile_bounded_patterns,
+        match_bounded_pattern,
+        slack_user_mention_tokens,
+        slack_user_mentions,
+        strip_slack_user_mentions,
+    )
 except ImportError:  # pragma: no cover - plugin loaded outside package context
     from block_kit import render_blocks, sanitize_blocks  # type: ignore
+    from thread_routing import (  # type: ignore
+        RoutingContext,
+        RoutingDisposition,
+        ThreadRoutingPolicy,
+        compile_bounded_patterns,
+        match_bounded_pattern,
+        slack_user_mention_tokens,
+        slack_user_mentions,
+        strip_slack_user_mentions,
+    )
 
 
 logger = logging.getLogger(__name__)
@@ -927,6 +947,7 @@ class SlackAdapter(BasePlatformAdapter):
         # Multi-workspace support
         self._team_clients: Dict[str, Any] = {}  # team_id → WebClient
         self._team_bot_user_ids: Dict[str, str] = {}  # team_id → bot_user_id
+        self._team_bot_ids: Dict[str, str] = {}  # team_id → Slack bot_id
         # channel_id → team_id. Grows with every channel AND every DM the bot
         # sees (DM channel IDs are per-user), so it must be bounded on busy
         # multi-workspace installs. Eviction is safe: entries are re-learned
@@ -972,12 +993,13 @@ class SlackAdapter(BasePlatformAdapter):
         self._BOT_TS_MAX = 5000  # cap to avoid unbounded growth
         # Track threads where the bot has been @mentioned — once mentioned,
         # respond to ALL subsequent messages in that thread automatically.
-        self._mentioned_threads: set[str] = set()
+        self._mentioned_threads: set[Any] = set()
         self._MENTIONED_THREADS_MAX = 5000
-        # Workspace/channel/thread-scoped strict-mention state. Durable state
-        # is loaded lazily from JSON so a restart observes user-issued stop
-        # controls before any thread context or attachment work begins.
-        self._THREAD_ROUTING_STATE_MAX = 5000
+        # Policy owns config parsing, validated control matching, and durable
+        # strict state. The adapter retains only ephemeral routing evidence.
+        self._thread_routing_policy = ThreadRoutingPolicy(
+            self.config.extra.get("thread_routing")
+        )
         self._slack_active_thread_keys: set[str] = set()
         self._SLACK_ACTIVE_THREAD_KEYS_MAX = 5000
         # Assistant thread metadata keyed by (team_id, channel_id, thread_ts).
@@ -1117,8 +1139,10 @@ class SlackAdapter(BasePlatformAdapter):
     def _trim_mentioned_threads(self) -> None:
         if len(self._mentioned_threads) <= self._MENTIONED_THREADS_MAX:
             return
-        self._discard_oldest_slack_timestamps(
-            self._mentioned_threads, self._MENTIONED_THREADS_MAX // 2
+        self._discard_oldest_by_thread_ts(
+            self._mentioned_threads,
+            self._MENTIONED_THREADS_MAX // 2,
+            lambda marker: marker[-1] if isinstance(marker, tuple) else marker,
         )
 
     @staticmethod
@@ -1185,6 +1209,80 @@ class SlackAdapter(BasePlatformAdapter):
             self._channel_team.pop(channel_id, None)
         self._trim_oldest_dict_entries(self._channel_team, self._CHANNEL_TEAM_MAX)
         self._trim_oldest_dict_entries(self._channel_teams, self._CHANNEL_TEAM_MAX)
+
+    def _resolve_workspace_team_scope(
+        self, channel_id: str, team_id: str = ""
+    ) -> Optional[str]:
+        """Resolve an admitted workspace without borrowing another team's state.
+
+        ``""`` represents a legacy unscoped runtime and is returned only when
+        every scoped client and bot-identity registry is empty. ``None`` means
+        scoped runtime state exists but does not identify one exact workspace.
+        """
+        explicit_team_id = str(team_id or "")
+        if explicit_team_id:
+            return explicit_team_id
+
+        channel_id = str(channel_id or "")
+        channel_teams = getattr(self, "_channel_teams", {}).get(channel_id, set())
+        if len(channel_teams) > 1:
+            return None
+
+        cached_team_id = getattr(self, "_channel_team", {}).get(channel_id, "")
+        if cached_team_id:
+            return str(cached_team_id)
+        if len(channel_teams) == 1:
+            return str(next(iter(channel_teams)))
+
+        registered_team_ids = set()
+        for attr in (
+            "_team_clients",
+            "_team_bot_user_ids",
+            "_team_bot_ids",
+            "_team_bot_names",
+        ):
+            registered_team_ids.update(getattr(self, attr, {}))
+        if len(registered_team_ids) == 1:
+            return str(next(iter(registered_team_ids)))
+        if registered_team_ids:
+            return None
+        return ""
+
+    def _admit_workspace_team_scope(
+        self, channel_id: str, team_id: str = ""
+    ) -> Optional[str]:
+        """Resolve workspace scope and prove its exact client when scoped."""
+        resolved_team_id = self._resolve_workspace_team_scope(channel_id, team_id)
+        if resolved_team_id is None:
+            return None
+        if resolved_team_id and self._get_client(
+            channel_id, team_id=resolved_team_id
+        ) is None:
+            return None
+        return resolved_team_id
+
+    def _bot_user_id_for_team_scope(self, team_id: str) -> Optional[str]:
+        """Resolve our bot user ID without crossing an ambiguous workspace scope."""
+        team_bot_user_ids = getattr(self, "_team_bot_user_ids", {})
+        if team_id:
+            scoped_bot_user_id = team_bot_user_ids.get(team_id)
+            if scoped_bot_user_id:
+                return scoped_bot_user_id
+            return self._bot_user_id if not team_bot_user_ids else None
+        if len(team_bot_user_ids) == 1:
+            return next(iter(team_bot_user_ids.values())) or self._bot_user_id
+        if not team_bot_user_ids:
+            return self._bot_user_id
+        return None
+
+    def _bot_id_for_team_scope(self, team_id: str) -> Optional[str]:
+        """Resolve our Slack bot_id without crossing an ambiguous workspace scope."""
+        team_bot_ids = getattr(self, "_team_bot_ids", {})
+        if team_id:
+            return team_bot_ids.get(team_id)
+        if len(team_bot_ids) == 1:
+            return next(iter(team_bot_ids.values())) or None
+        return None
 
     def _start_socket_mode_handler(self) -> None:
         """Start the Slack Socket Mode background task."""
@@ -1902,10 +2000,12 @@ class SlackAdapter(BasePlatformAdapter):
             # Reset multi-workspace state before re-populating it so a
             # reconnect that drops a workspace (or rotates the primary bot
             # token) doesn't carry stale ``_bot_user_id`` / ``_team_clients``
-            # / ``_team_bot_user_ids`` entries from the prior session.
+            # / ``_team_bot_user_ids`` / ``_team_bot_ids`` entries from the
+            # prior session.
             self._bot_user_id = None
             self._team_clients = {}
             self._team_bot_user_ids = {}
+            self._team_bot_ids = {}
             self._bot_display_name = None
             self._team_bot_names = {}
 
@@ -1928,11 +2028,14 @@ class SlackAdapter(BasePlatformAdapter):
                 auth_response = await client.auth_test()
                 team_id = auth_response.get("team_id", "")
                 bot_user_id = auth_response.get("user_id", "")
+                bot_id = auth_response.get("bot_id", "")
                 bot_name = auth_response.get("user", "unknown")
                 team_name = auth_response.get("team", "unknown")
 
                 self._team_clients[team_id] = client
                 self._team_bot_user_ids[team_id] = bot_user_id
+                if bot_id:
+                    self._team_bot_ids[team_id] = bot_id
                 self._team_bot_names[team_id] = bot_name
 
                 # First token always wins as the primary bot user id; we
@@ -2000,12 +2103,12 @@ class SlackAdapter(BasePlatformAdapter):
             # not fill gateway.error.log with Slack Bolt "Unhandled request"
             # warnings.
             @self._app.event("reaction_added")
-            async def handle_reaction_added(event, say):
-                await self._handle_slack_reaction(event)
+            async def handle_reaction_added(event, say, body):
+                await self._handle_slack_reaction(event, body)
 
             @self._app.event("reaction_removed")
-            async def handle_reaction_removed(event, say):
-                await self._handle_slack_reaction(event, removed=True)
+            async def handle_reaction_removed(event, say, body):
+                await self._handle_slack_reaction(event, body, removed=True)
 
             @self._app.event("assistant_thread_started")
             async def handle_assistant_thread_started(event, say, body):
@@ -2306,6 +2409,8 @@ class SlackAdapter(BasePlatformAdapter):
         self._bot_user_id = None
         self._team_clients = {}
         self._team_bot_user_ids = {}
+        self._team_bot_ids = {}
+        self._team_bot_names = {}
         self._channel_team = {}
         self._dm_conversation_cache = {}
 
@@ -2353,14 +2458,41 @@ class SlackAdapter(BasePlatformAdapter):
         """Return an in-memory routing marker without changing legacy no-team tests."""
         return (str(team_id), str(message_id)) if team_id else str(message_id)
 
+    @staticmethod
+    def _workspace_thread_marker(
+        team_id: str, channel_id: str, thread_ts: str
+    ) -> Any:
+        """Scope ephemeral thread routing evidence by Slack-local dimensions."""
+        if team_id:
+            return (str(team_id), str(channel_id), str(thread_ts))
+        return str(thread_ts)
+
     def _get_client(self, chat_id: str, team_id: Optional[str] = None) -> Any:
         """Return the workspace-specific WebClient for a channel."""
-        if team_id and team_id in self._team_clients:
-            return self._team_clients[team_id]
-        team_id = self._channel_team.get(chat_id)
-        if team_id and team_id in self._team_clients:
-            return self._team_clients[team_id]
-        return self._app.client  # fallback to primary
+        team_clients = getattr(self, "_team_clients", {})
+        if team_id:
+            if team_id in team_clients:
+                return team_clients[team_id]
+            # An explicit scope must never borrow another workspace's client.
+            # Preserve the legacy single-workspace path only when no scoped
+            # workspace registry has been populated at all. During reconnect,
+            # identity registries can outlive a temporarily empty client map;
+            # that is still scoped runtime state, not an unscoped legacy path.
+            scoped_registries = (
+                team_clients,
+                getattr(self, "_team_bot_user_ids", {}),
+                getattr(self, "_team_bot_ids", {}),
+                getattr(self, "_team_bot_names", {}),
+            )
+            if any(scoped_registries):
+                return None
+            app = getattr(self, "_app", None)
+            return app.client if app else None
+        cached_team_id = getattr(self, "_channel_team", {}).get(chat_id)
+        if cached_team_id and cached_team_id in team_clients:
+            return team_clients[cached_team_id]
+        app = getattr(self, "_app", None)
+        return app.client if app else None  # fallback to primary
 
     async def _ensure_dm_conversation(
         self, chat_id: str, team_id: Optional[str] = None
@@ -3925,21 +4057,29 @@ class SlackAdapter(BasePlatformAdapter):
         """
         if not text or "<@" not in text:
             return text
-        # Capture the bare user ID inside <@...>; Slack IDs are alnum (U…/W…),
-        # optionally carrying a label like <@U123|alice> — keep only the ID.
-        ids = set(re.findall(r"<@([A-Z0-9]+)(?:\|[^>]*)?>", text))
-        if not ids:
+        mention_tokens = slack_user_mention_tokens(text)
+        if not mention_tokens:
             return text
-        for uid in ids:
+
+        display_names: dict[str, str] = {}
+        for uid, _, _ in mention_tokens:
+            if uid in display_names:
+                continue
             name = await self._resolve_user_name(
                 uid, chat_id=chat_id, team_id=team_id
             )
             # Fall back to the raw ID if resolution yields nothing usable
             # (keeps the message intact rather than emptying a mention).
-            display = (name or uid).strip() or uid
-            # Replace both the bare and labelled forms of this exact ID.
-            text = re.sub(rf"<@{uid}(?:\|[^>]*)?>", f"@{display}", text)
-        return text
+            display_names[uid] = (name or uid).strip() or uid
+
+        parts: list[str] = []
+        cursor = 0
+        for uid, start, end in mention_tokens:
+            parts.append(text[cursor:start])
+            parts.append(f"@{display_names[uid]}")
+            cursor = end
+        parts.append(text[cursor:])
+        return "".join(parts)
 
     def _build_identity_prompt(self, team_id: str = "") -> str:
         """Return an ephemeral system-prompt line grounding the bot's identity.
@@ -4707,11 +4847,22 @@ class SlackAdapter(BasePlatformAdapter):
     ) -> None:
         """Handle Slack Assistant lifecycle events that carry user/thread identity."""
         metadata = self._extract_assistant_thread_metadata(event, body)
+        channel_id = metadata.get("channel_id", "")
+        team_id = self._admit_workspace_team_scope(
+            channel_id, metadata.get("team_id", "")
+        )
+        if team_id is None:
+            logger.debug(
+                "[Slack] Dropping Assistant lifecycle event with unresolved "
+                "workspace scope"
+            )
+            return
+        metadata["team_id"] = team_id
         self._cache_assistant_thread_metadata(metadata)
         self._seed_assistant_thread_session(metadata)
         await self._set_assistant_suggested_prompts(
-            metadata.get("channel_id", ""),
-            team_id=metadata.get("team_id", ""),
+            channel_id,
+            team_id=team_id,
             thread_ts=metadata.get("thread_ts", ""),
         )
 
@@ -4722,7 +4873,14 @@ class SlackAdapter(BasePlatformAdapter):
         context = event.get("context") or event.get("app_context") or {}
         context_channel_id = self._context_channel_id(context)
         user_id = event.get("user") or event.get("user_id") or ""
-        team_id = self._event_team_id(event, body)
+        team_id = self._admit_workspace_team_scope(
+            context_channel_id, self._event_team_id(event, body)
+        )
+        if team_id is None:
+            logger.debug(
+                "[Slack] Dropping app_context_changed with unresolved workspace scope"
+            )
+            return
         # ``context_channel_id`` is a channel the user is viewing, not the DM
         # Hermes owns. Do not write it into _channel_team: channel IDs can be
         # shared across Slack Connect workspaces, so doing so can misroute a
@@ -4746,7 +4904,14 @@ class SlackAdapter(BasePlatformAdapter):
         context = event.get("context") or event.get("app_context") or {}
         channel_id = event.get("channel") or event.get("channel_id") or ""
         user_id = event.get("user") or event.get("user_id") or ""
-        team_id = self._event_team_id(event, body)
+        team_id = self._admit_workspace_team_scope(
+            channel_id, self._event_team_id(event, body)
+        )
+        if team_id is None:
+            logger.debug(
+                "[Slack] Dropping app_home_opened with unresolved workspace scope"
+            )
+            return
         context_channel_id = self._context_channel_id(context)
 
         if team_id and channel_id:
@@ -4786,7 +4951,12 @@ class SlackAdapter(BasePlatformAdapter):
         "wave": "👋",
     }
 
-    async def _handle_slack_reaction(self, event: dict, removed: bool = False) -> None:
+    async def _handle_slack_reaction(
+        self,
+        event: dict,
+        body: Optional[dict] = None,
+        removed: bool = False,
+    ) -> None:
         """Forward reaction events through the normal message pipeline.
 
         The reactor's user_id becomes the synthesized message's user, so the
@@ -4830,13 +5000,25 @@ class SlackAdapter(BasePlatformAdapter):
         user_id = event.get("user")
         if not channel_id or not msg_ts or not user_id or not reaction_name:
             return
-        # Drop self-reactions (lifecycle markers like :eyes: on incoming msgs).
-        if self._bot_user_id and user_id == self._bot_user_id:
+        team_id = self._admit_workspace_team_scope(
+            channel_id, self._event_team_id(event, body)
+        )
+        if team_id is None:
+            logger.debug("[Slack] Dropping reaction with unresolved workspace scope")
             return
-        team_id = self._channel_team.get(channel_id) or ""
-        if not team_id and self._team_clients:
-            team_id = next(iter(self._team_clients))
-        client = self._team_clients.get(team_id) if team_id else None
+        bot_uid = self._bot_user_id_for_team_scope(team_id)
+        if not bot_uid:
+            logger.debug("[Slack] Dropping reaction with unresolved workspace scope")
+            return
+        # Drop self-reactions (lifecycle markers like :eyes: on incoming msgs).
+        if user_id == bot_uid:
+            return
+        client = self._get_client(channel_id, team_id=team_id)
+        if client is None:
+            logger.debug(
+                "[Slack] Dropping reaction with unresolved workspace client"
+            )
+            return
 
         action = "removed" if removed else "added"
 
@@ -4901,7 +5083,6 @@ class SlackAdapter(BasePlatformAdapter):
                     # chose trigger emojis, so those may target any
                     # message (emoji-handoff workflows).
                     item_user = event.get("item_user") or first.get("user") or ""
-                    bot_uid = self._team_bot_user_ids.get(team_id) or self._bot_user_id
                     if (
                         not explicit_allowlist
                         and item_user
@@ -4919,7 +5100,6 @@ class SlackAdapter(BasePlatformAdapter):
             # explicit allowlist we cannot prove the reaction targets our
             # own message, so verify via the event's item_user alone.
             item_user = event.get("item_user") or ""
-            bot_uid = self._team_bot_user_ids.get(team_id) or self._bot_user_id
             if item_user and bot_uid and item_user != bot_uid:
                 return
 
@@ -5043,12 +5223,17 @@ class SlackAdapter(BasePlatformAdapter):
         if not channel_id or not file_id:
             return
 
-        team_id = self._event_team_id(event, body)
-        try:
-            client = self._team_clients.get(team_id) if team_id else None
-            info_resp = await (client or self._get_client(channel_id)).files_info(
-                file=file_id
+        team_id = self._admit_workspace_team_scope(
+            channel_id, self._event_team_id(event, body)
+        )
+        if team_id is None:
+            logger.debug(
+                "[Slack] Dropping file_shared event with unresolved workspace client"
             )
+            return
+        client = self._get_client(channel_id, team_id=team_id or None)
+        try:
+            info_resp = await client.files_info(file=file_id)
         except Exception as exc:
             response = getattr(exc, "response", None)
             detail = self._describe_slack_api_error(response, file_obj={"id": file_id})
@@ -5109,18 +5294,14 @@ class SlackAdapter(BasePlatformAdapter):
             fallback_event["thread_ts"] = thread_ts
         await self._handle_slack_message(fallback_event)
 
-    def _register_mentioned_thread(self, thread_ts: str, team_id: str = "") -> None:
-        """Record a thread as bot-mentioned so future replies auto-trigger.
-
-        Centralizes the bounded-set eviction previously inlined at the
-        mention branch of _handle_slack_message. Markers are workspace-scoped
-        (``(team_id, ts)``) when a team id is known so identical thread ts
-        values in two workspaces never wake each other's bot.
-        """
-        if not thread_ts:
+    def _register_mentioned_thread(
+        self, thread_ts: str, team_id: str = "", channel_id: str = ""
+    ) -> None:
+        """Record a thread as bot-mentioned so future replies auto-trigger."""
+        if not thread_ts or (team_id and not channel_id):
             return
         self._mentioned_threads.add(
-            self._workspace_message_marker(team_id, thread_ts)
+            self._workspace_thread_marker(team_id, channel_id, thread_ts)
         )
         self._trim_mentioned_threads()
 
@@ -5150,17 +5331,16 @@ class SlackAdapter(BasePlatformAdapter):
         if not bot_uid:
             return False
 
+        cache_key = f"{channel_id}:{thread_ts}:{team_id}"
+
         def _cached_parent_matches() -> Optional[bool]:
-            # Cache keys are "{channel_id}:{thread_ts}:{team_id}"; team_id may
-            # be empty at some call sites, so match on the channel+thread
-            # prefix rather than guessing the exact key.
-            for cached_key, cached_entry in self._thread_context_cache.items():
-                if cached_key.startswith(f"{channel_id}:{thread_ts}:"):
-                    return bool(
-                        cached_entry.parent_user_id
-                        and cached_entry.parent_user_id == bot_uid
-                    )
-            return None
+            cached_entry = self._thread_context_cache.get(cache_key)
+            if cached_entry is None:
+                return None
+            return bool(
+                cached_entry.parent_user_id
+                and cached_entry.parent_user_id == bot_uid
+            )
 
         cached = _cached_parent_matches()
         if cached is not None:
@@ -5202,19 +5382,13 @@ class SlackAdapter(BasePlatformAdapter):
         """
         if not event_thread_ts:
             return False
-        thread_marker = self._workspace_message_marker(team_id, event_thread_ts)
-        # Check both the workspace-scoped marker and the bare ts: entries
-        # recorded before a team id was learned (or by legacy paths) are bare
-        # strings, and a scoped-vs-bare mismatch must not silence the bot.
-        if is_thread_reply and (
-            thread_marker in self._bot_message_ts
-            or event_thread_ts in self._bot_message_ts
-        ):
+        bot_message_marker = self._workspace_message_marker(team_id, event_thread_ts)
+        mentioned_thread_marker = self._workspace_thread_marker(
+            team_id, channel_id, event_thread_ts
+        )
+        if is_thread_reply and bot_message_marker in self._bot_message_ts:
             return True
-        if (
-            thread_marker in self._mentioned_threads
-            or event_thread_ts in self._mentioned_threads
-        ):
+        if mentioned_thread_marker in self._mentioned_threads:
             return True
         if is_thread_reply and self._has_active_session_for_thread(
             channel_id=channel_id,
@@ -5245,10 +5419,14 @@ class SlackAdapter(BasePlatformAdapter):
                     team_id=team_id,
                     strip_bot_mention=False,
                 )
-                if parent_text and f"<@{bot_uid}>" in parent_text:
+                if parent_text and bot_uid in slack_user_mentions(parent_text):
                     # Remember the thread so later replies skip the fetch.
                     if not self._slack_strict_mention():
-                        self._register_mentioned_thread(event_thread_ts)
+                        self._register_mentioned_thread(
+                            event_thread_ts,
+                            team_id=team_id,
+                            channel_id=channel_id,
+                        )
                     return True
         return False
 
@@ -5312,17 +5490,6 @@ class SlackAdapter(BasePlatformAdapter):
                 normalized_event["_slack_changed_event_ts"] = changed_event_ts
             event = normalized_event
 
-        # Dedup: Slack Socket Mode can redeliver events after reconnects (#4777)
-        # Scope the dedup id by workspace: Slack event ts values are only
-        # unique within one workspace, so two teams' events with the same ts
-        # must not suppress each other.
-        event_ts = event.get("_slack_changed_event_ts") or event.get("ts", "")
-        dedup_team_id = self._event_team_id(event, payload)
-        if event_ts and self._dedup.is_duplicate(
-            self._workspace_event_id(dedup_team_id, event_ts)
-        ):
-            return
-
         channel_id = event.get("channel", "")
         if self._is_ignored_channel(channel_id):
             logger.info("[Slack] Ignoring message in configured ignored channel %s", channel_id)
@@ -5343,30 +5510,63 @@ class SlackAdapter(BasePlatformAdapter):
         # real human-authored Slack messages normally carry client_msg_id;
         # bot/app-originated events that slip past the markers often do not.
         msg_user = event.get("user", "")
+        event_team_id = self._admit_workspace_team_scope(
+            channel_id, self._event_team_id(event, payload)
+        )
+        if event_team_id is None:
+            logger.debug("[Slack] Dropping message with unresolved workspace scope")
+            return
+
+        # Dedup only after workspace admission. Rejected deliveries must not
+        # consume the identifier that a later admitted redelivery needs.
+        event_ts = event.get("_slack_changed_event_ts") or event.get("ts", "")
+        if event_ts and self._dedup.is_duplicate(
+            self._workspace_event_id(event_team_id, event_ts)
+        ):
+            return
+        event_bot_uid = self._bot_user_id_for_team_scope(event_team_id)
+        event_bot_id = str(event.get("bot_id") or "")
+        event_own_bot_id = self._bot_id_for_team_scope(event_team_id)
         sender_is_bot = self._event_declares_bot_sender(event)
         if not sender_is_bot and msg_user and not event.get("client_msg_id"):
             sender_is_bot = await self._resolve_user_is_bot(
                 msg_user,
                 chat_id=event.get("channel", ""),
-                team_id=str(event.get("team") or event.get("team_id") or ""),
+                team_id=event_team_id,
             )
         if sender_is_bot:
+            if not event_bot_uid:
+                logger.debug(
+                    "[Slack] Dropping bot message with unresolved workspace scope"
+                )
+                return
+            if not msg_user and not event_own_bot_id:
+                logger.debug(
+                    "[Slack] Dropping userless bot message with unresolved bot identity"
+                )
+                return
             allow_bots = self._slack_allow_bots()
             if allow_bots == "none":
                 return
             elif allow_bots == "mentions":
                 # Include Block-Kit-only mentions, not just the flat text (#52387)
                 text_check = _slack_mention_detection_text(event)
-                if self._bot_user_id and f"<@{self._bot_user_id}>" not in text_check:
+                if (
+                    not event_bot_uid
+                    or event_bot_uid not in slack_user_mentions(text_check)
+                ):
                     logger.debug(
                         "[Slack] Dropping bot message under allow_bots=mentions: "
-                        "no <@%s> mention in flat text or blocks",
-                        self._bot_user_id,
+                        "no current-workspace bot mention in flat text or blocks"
                     )
                     return
             # "all" falls through to process the message
-            # Always ignore our own messages to prevent echo loops
-            if msg_user and self._bot_user_id and msg_user == self._bot_user_id:
+            # Always ignore our own messages to prevent echo loops. Slack bot
+            # events may omit ``user``; ``bot_id`` from auth.test is the
+            # workspace-scoped identity for that event shape.
+            if (msg_user and msg_user == event_bot_uid) or (
+                event_bot_id and event_bot_id == event_own_bot_id
+            ):
                 return
 
         # Ignore message deletions. Edits are normalized above so an @mention
@@ -5495,7 +5695,11 @@ class SlackAdapter(BasePlatformAdapter):
 
         channel_id = event.get("channel", "")
         ts = event.get("ts", "")
-        outer_team_id = self._event_team_id(event, payload)
+        # Keep the scope resolved by the pre-admission gate authoritative. It
+        # may come from a unique registered workspace when Slack omits team_id;
+        # re-deriving from the raw event here would lose that scope and let
+        # downstream user/client/session work fall back to the primary workspace.
+        outer_team_id = event_team_id
         assistant_meta = self._lookup_assistant_thread_metadata(
             event,
             channel_id=channel_id,
@@ -5542,6 +5746,12 @@ class SlackAdapter(BasePlatformAdapter):
         # case earns the DM exemptions; session/thread scoping below still treats
         # both as DM-style persistent conversations.
         is_one_to_one_dm = channel_type == "im"
+        bot_uid = self._bot_user_id_for_team_scope(str(team_id or ""))
+        if not is_one_to_one_dm and not bot_uid:
+            logger.debug(
+                "[Slack] Dropping channel message with unresolved workspace scope"
+            )
+            return
 
         # Reject unauthorized users before thread lookups, name resolution,
         # or file downloads.  The final gateway runner auth check happens
@@ -5628,16 +5838,24 @@ class SlackAdapter(BasePlatformAdapter):
         #   2. The message is a reply in a thread the bot started/participated in, OR
         #   3. The message is in a thread where the bot was previously @mentioned, OR
         #   4. There's an existing session for this thread (survives restarts)
-        bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
         # Detect mentions authored only inside Block Kit blocks too (#52387)
         routing_text = _slack_mention_detection_text(event) or original_text or ""
-        is_mentioned = bool(
-            (bot_uid and f"<@{bot_uid}>" in routing_text)
-            or self._slack_message_matches_mention_patterns(routing_text)
+        slack_bot_mention = bool(
+            bot_uid
+            and self._slack_message_mentions_self(routing_text, {bot_uid})
         )
+        pattern_bot_mention = False
+        if not slack_bot_mention:
+            pattern_bot_mention = await asyncio.to_thread(
+                self._slack_message_matches_mention_patterns,
+                routing_text,
+            )
+        is_mentioned = slack_bot_mention or pattern_bot_mention
         mention_command_text = ""
         if is_mentioned and bot_uid:
-            mention_stripped_probe = original_text.replace(f"<@{bot_uid}>", "").strip()
+            mention_stripped_probe = strip_slack_user_mentions(
+                original_text, {bot_uid}
+            ).strip()
             if mention_stripped_probe.startswith("/"):
                 mention_command_text = mention_stripped_probe
             else:
@@ -5661,6 +5879,7 @@ class SlackAdapter(BasePlatformAdapter):
         # ``allow_bots: mentions`` require the current message text to mention
         # this bot — thread history, reply parents, and active sessions do not
         # count as a bot-to-bot summons.
+        sender_is_bot_user = False
         if user_id and user_id != bot_uid:
             sender_is_bot_user = self._event_declares_bot_sender(event)
             if not sender_is_bot_user:
@@ -5676,7 +5895,7 @@ class SlackAdapter(BasePlatformAdapter):
                 if allow_bots == "mentions" and not is_mentioned:
                     return
 
-        if not is_one_to_one_dm and bot_uid:
+        if not is_one_to_one_dm:
             # Check allowed channels — if set, only respond in these channels (whitelist)
             allowed_channels = self._slack_allowed_channels()
             if allowed_channels and channel_id not in allowed_channels:
@@ -5685,16 +5904,12 @@ class SlackAdapter(BasePlatformAdapter):
                 )
                 return
 
-            # A user-issued stop control is durable, thread-local strict
-            # mention mode. Evaluate it before context/file hydration and
-            # before the normal wake checks so suppressed turns never enter
-            # the agent loop or incur attachment downloads.
+            # Apply the isolated state/policy decision before thread context or
+            # files are hydrated. The adapter supplies only Slack routing facts;
+            # durable state and control semantics belong to ThreadRoutingPolicy.
             control_thread_ts = thread_ts or event_thread_ts or ts
-            if (
-                self._slack_thread_routing_enabled()
-                and control_thread_ts
-                and not (is_command_text or mention_command_text)
-            ):
+            has_thread_session = False
+            if self._thread_routing_policy.enabled and control_thread_ts:
                 has_thread_session = self._has_active_session_for_thread(
                     channel_id=channel_id,
                     thread_ts=control_thread_ts,
@@ -5702,7 +5917,9 @@ class SlackAdapter(BasePlatformAdapter):
                     team_id=team_id,
                     chat_type="dm" if is_dm else "group",
                 )
-                has_scoped_active_thread = (
+            has_scoped_active_thread = bool(
+                control_thread_ts
+                and (
                     self._has_scoped_active_slack_thread(
                         team_id=team_id,
                         channel_id=channel_id,
@@ -5710,55 +5927,38 @@ class SlackAdapter(BasePlatformAdapter):
                     )
                     or has_thread_session
                 )
-
-                if (
-                    not is_mentioned
-                    and self._slack_thread_routing_config().get(
-                        "suppress_other_user_mentions", True
-                    )
-                    and has_scoped_active_thread
-                    and self._slack_text_mentions_other_user(routing_text, bot_uid)
-                ):
-                    return
-
-                stop_pattern = self._matches_slack_thread_control(
-                    routing_text, "stop"
-                )
-                resume_pattern = self._matches_slack_thread_control(
-                    routing_text, "resume"
-                )
-                is_thread_strict = self._is_slack_thread_strict(
+            )
+            direct_bot_mention = is_mentioned
+            policy_decision = await asyncio.to_thread(
+                self._thread_routing_policy.evaluate,
+                RoutingContext(
                     team_id=team_id,
                     channel_id=channel_id,
                     thread_ts=control_thread_ts,
-                )
-
-                if resume_pattern and is_mentioned:
-                    self._clear_slack_thread_strict(
-                        team_id=team_id,
-                        channel_id=channel_id,
-                        thread_ts=control_thread_ts,
-                    )
-                elif stop_pattern and (is_mentioned or has_scoped_active_thread):
-                    self._set_slack_thread_strict(
-                        team_id=team_id,
-                        channel_id=channel_id,
-                        thread_ts=control_thread_ts,
-                        user_id=user_id,
-                        message_ts=ts,
-                        matched_pattern=stop_pattern,
-                    )
-                    return
-                elif stop_pattern:
-                    return
-                elif is_thread_strict and not is_mentioned:
-                    return
+                    user_id=user_id,
+                    message_ts=ts,
+                    text=routing_text,
+                    direct_bot_mention=direct_bot_mention,
+                    active_agent_thread=has_scoped_active_thread,
+                    mentions_other_user=ThreadRoutingPolicy.mentions_other_user(
+                        routing_text, bot_uid
+                    ),
+                    is_command=bool(is_command_text or mention_command_text),
+                    peer_bot=sender_is_bot_user,
+                ),
+            )
+            if policy_decision.disposition in {
+                RoutingDisposition.SUPPRESS_CONTROL,
+                RoutingDisposition.SUPPRESS_STRICT,
+                RoutingDisposition.SUPPRESS_OTHER_USER_MENTION,
+            }:
+                return
 
             # A message that opens by @mentioning another user is directed at
             # that person. Stay silent unless we are also mentioned — this
             # overrides free-response and mentioned-thread auto-follow so the
             # bot does not butt in on chatter aimed at someone else.
-            self_uids = {u for u in (bot_uid, self._bot_user_id) if u}
+            self_uids = {bot_uid}
             if (
                 self._slack_ignore_other_user_mentions()
                 and not is_mentioned
@@ -5825,14 +6025,17 @@ class SlackAdapter(BasePlatformAdapter):
 
         if is_mentioned:
             # Strip the bot mention from the text
-            text = text.replace(f"<@{bot_uid}>", "").strip()
+            bot_user_ids = {bot_uid} if bot_uid else set()
+            text = strip_slack_user_mentions(text, bot_user_ids).strip()
             # Re-run command normalization against the canonical Slack text,
             # not the block-augmented agent text. Otherwise quoted/forwarded
             # rich-text payload can become accidental command arguments.
             # Handles both ``@bot !cmd`` (bang hidden behind the mention when
             # the first probe ran) and ``@bot /cmd`` (typed slash addressed
             # at the bot).
-            mention_stripped = original_text.replace(f"<@{bot_uid}>", "").strip()
+            mention_stripped = strip_slack_user_mentions(
+                original_text, bot_user_ids
+            ).strip()
             if mention_command_text:
                 command_text = mention_command_text
             elif mention_stripped.startswith("/"):
@@ -5861,7 +6064,11 @@ class SlackAdapter(BasePlatformAdapter):
                 and not self._slack_strict_mention()
                 and not self._slack_thread_require_mention()
             ):
-                self._register_mentioned_thread(thread_ts, team_id=team_id)
+                self._register_mentioned_thread(
+                    thread_ts,
+                    team_id=team_id,
+                    channel_id=channel_id,
+                )
 
         # Thread context rules:
         # - First message in a thread session (cold start): hydrate full
@@ -6819,7 +7026,6 @@ class SlackAdapter(BasePlatformAdapter):
         """Handle a slash-confirm button click from Block Kit."""
         await ack()
 
-        team_id = self._event_team_id({}, body)
         action_id = action.get("action_id", "")
         value = action.get("value", "")
         message = body.get("message", {})
@@ -6827,6 +7033,15 @@ class SlackAdapter(BasePlatformAdapter):
         channel_id = body.get("channel", {}).get("id", "")
         user_name = body.get("user", {}).get("name", "unknown")
         user_id = body.get("user", {}).get("id", "")
+        team_id = self._admit_workspace_team_scope(
+            channel_id, self._event_team_id({}, body)
+        )
+        if team_id is None:
+            logger.debug(
+                "[Slack] Dropping slash-confirm action with unresolved workspace scope"
+            )
+            return
+        client = self._get_client(channel_id, team_id=team_id or None)
         if not self._is_interactive_user_authorized(
             user_id,
             channel_id=channel_id,
@@ -6901,7 +7116,7 @@ class SlackAdapter(BasePlatformAdapter):
         ]
 
         try:
-            await self._get_client(channel_id, team_id=team_id or None).chat_update(
+            await client.chat_update(
                 channel=channel_id,
                 ts=msg_ts,
                 text=decision_text,
@@ -6926,9 +7141,7 @@ class SlackAdapter(BasePlatformAdapter):
                 thread_ts = message.get("thread_ts") or msg_ts
                 if thread_ts:
                     post_kwargs["thread_ts"] = thread_ts
-                await self._get_client(
-                    channel_id, team_id=team_id or None
-                ).chat_postMessage(**post_kwargs)
+                await client.chat_postMessage(**post_kwargs)
             logger.info(
                 "Slack button resolved slash-confirm for session %s (choice=%s, user=%s)",
                 session_key,
@@ -6962,7 +7175,6 @@ class SlackAdapter(BasePlatformAdapter):
         """Handle an approval button click from Block Kit."""
         await ack()
 
-        team_id = self._event_team_id({}, body)
         action_id = action.get("action_id", "")
         session_key = action.get("value", "")
         message = body.get("message", {})
@@ -6970,6 +7182,15 @@ class SlackAdapter(BasePlatformAdapter):
         channel_id = body.get("channel", {}).get("id", "")
         user_name = body.get("user", {}).get("name", "unknown")
         user_id = body.get("user", {}).get("id", "")
+        team_id = self._admit_workspace_team_scope(
+            channel_id, self._event_team_id({}, body)
+        )
+        if team_id is None:
+            logger.debug(
+                "[Slack] Dropping approval action with unresolved workspace scope"
+            )
+            return
+        client = self._get_client(channel_id, team_id=team_id or None)
 
         if not self._is_interactive_user_authorized(
             user_id,
@@ -7080,7 +7301,7 @@ class SlackAdapter(BasePlatformAdapter):
         ]
 
         try:
-            await self._get_client(channel_id, team_id=team_id or None).chat_update(
+            await client.chat_update(
                 channel=channel_id,
                 ts=msg_ts,
                 text=decision_text,
@@ -7097,6 +7318,8 @@ class SlackAdapter(BasePlatformAdapter):
         msg_ts: str,
         question_text: str,
         decision_text: str,
+        *,
+        client: Any,
     ) -> None:
         """Rewrite a clarify message to show the outcome and drop the buttons."""
         updated_blocks = [
@@ -7110,7 +7333,7 @@ class SlackAdapter(BasePlatformAdapter):
             },
         ]
         try:
-            await self._get_client(channel_id).chat_update(
+            await client.chat_update(
                 channel=channel_id,
                 ts=msg_ts,
                 text=decision_text,
@@ -7130,11 +7353,21 @@ class SlackAdapter(BasePlatformAdapter):
         channel_id = body.get("channel", {}).get("id", "")
         user_name = body.get("user", {}).get("name", "unknown")
         user_id = body.get("user", {}).get("id", "")
+        team_id = self._admit_workspace_team_scope(
+            channel_id, self._event_team_id({}, body)
+        )
+        if team_id is None:
+            logger.debug(
+                "[Slack] Dropping clarify action with unresolved workspace scope"
+            )
+            return
+        client = self._get_client(channel_id, team_id=team_id or None)
 
         if not self._is_interactive_user_authorized(
             user_id,
             channel_id=channel_id,
             user_name=user_name,
+            team_id=team_id,
         ):
             logger.warning(
                 "[Slack] Unauthorized clarify click by %s (%s) - ignoring",
@@ -7173,11 +7406,13 @@ class SlackAdapter(BasePlatformAdapter):
                 await self._update_clarify_message(
                     channel_id, msg_ts, original_text,
                     f"⏳ This prompt expired — please send a new request. (by {user_name})",
+                    client=client,
                 )
                 return
             await self._update_clarify_message(
                 channel_id, msg_ts, original_text,
                 f"✏️ Awaiting typed answer from {user_name}…",
+                client=client,
             )
             return
 
@@ -7205,6 +7440,7 @@ class SlackAdapter(BasePlatformAdapter):
             await self._update_clarify_message(
                 channel_id, msg_ts, original_text,
                 f"✅ {user_name}: {resolved_text}",
+                client=client,
             )
             # Privacy: keep the chosen option text out of INFO-level logs
             # (clarify choices can carry user/session context). Metadata at
@@ -7223,6 +7459,7 @@ class SlackAdapter(BasePlatformAdapter):
             await self._update_clarify_message(
                 channel_id, msg_ts, original_text,
                 f"⏳ This prompt expired — please send a new request. (by {user_name})",
+                client=client,
             )
             logger.warning(
                 "[Slack] clarify resolve returned False (id=%s) — expired/reset",
@@ -7760,8 +7997,14 @@ class SlackAdapter(BasePlatformAdapter):
         text = raw_text
         user_id = command.get("user_id", "")
         channel_id = command.get("channel_id", "")
-        team_id = command.get("team_id", "")
-
+        team_id = self._admit_workspace_team_scope(
+            channel_id, command.get("team_id", "")
+        )
+        if team_id is None:
+            logger.debug(
+                "[Slack] Dropping slash command with unresolved workspace scope"
+            )
+            return
         # Track which workspace owns this channel
         if team_id and channel_id:
             self._remember_channel_team(channel_id, team_id)
@@ -8073,36 +8316,14 @@ class SlackAdapter(BasePlatformAdapter):
 
     # ── Per-thread strict routing controls ────────────────────────────────
 
-    def _slack_thread_routing_config(self) -> Dict[str, Any]:
-        raw = self.config.extra.get("thread_routing") or {}
-        return raw if isinstance(raw, dict) else {}
-
     def _slack_thread_routing_enabled(self) -> bool:
-        enabled = self._slack_thread_routing_config().get("enabled", False)
-        if isinstance(enabled, str):
-            return enabled.strip().lower() in {"true", "1", "yes", "on"}
-        return bool(enabled)
-
-    def _slack_thread_routing_state_path(self) -> _Path:
-        raw_path = str(
-            self._slack_thread_routing_config().get("state_file")
-            or "slack/thread_routing_state.json"
-        )
-        path = _Path(raw_path).expanduser()
-        if path.is_absolute():
-            return path
-        try:
-            from hermes_constants import get_hermes_home
-
-            return get_hermes_home() / path
-        except Exception:  # pragma: no cover - defensive fallback
-            return _Path(os.environ.get("HERMES_HOME", _Path.home() / ".hermes")) / path
+        return self._thread_routing_policy.enabled
 
     @staticmethod
     def _slack_thread_routing_key(
         team_id: str, channel_id: str, thread_ts: str
     ) -> str:
-        return f"{team_id}:{channel_id}:{thread_ts}"
+        return ThreadRoutingPolicy.key(team_id, channel_id, thread_ts)
 
     def _mark_slack_thread_active(
         self, *, team_id: str, channel_id: str, thread_ts: str
@@ -8129,124 +8350,6 @@ class SlackAdapter(BasePlatformAdapter):
             self._slack_thread_routing_key(team_id, channel_id, thread_ts)
             in self._slack_active_thread_keys
         )
-
-    def _load_slack_thread_routing_state(self) -> Dict[str, Any]:
-        path = self._slack_thread_routing_state_path()
-        if not path.exists():
-            return {}
-        try:
-            state = json.loads(path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            logger.warning(
-                "[Slack] Ignoring corrupt thread routing state at %s: %s",
-                path,
-                exc,
-            )
-            return {}
-        if not isinstance(state, dict):
-            logger.warning(
-                "[Slack] Ignoring invalid thread routing state at %s: expected object, got %s",
-                path,
-                type(state).__name__,
-            )
-            return {}
-        return state
-
-    def _write_slack_thread_routing_state(self, state: Dict[str, Any]) -> None:
-        path = self._slack_thread_routing_state_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = path.with_name(
-            f".{path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp"
-        )
-        tmp_path.write_text(
-            json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-        tmp_path.replace(path)
-
-    def _slack_thread_control_patterns(self, kind: str) -> List[str]:
-        raw = self._slack_thread_routing_config().get(f"{kind}_patterns") or []
-        if isinstance(raw, str):
-            return [raw]
-        if isinstance(raw, list):
-            return [str(item) for item in raw if str(item).strip()]
-        return []
-
-    def _matches_slack_thread_control(self, text: str, kind: str) -> Optional[str]:
-        for pattern in self._slack_thread_control_patterns(kind):
-            try:
-                if re.search(pattern, text, flags=re.IGNORECASE):
-                    return pattern
-            except re.error as exc:
-                logger.warning(
-                    "[Slack] Ignoring invalid thread %s pattern %r: %s",
-                    kind,
-                    pattern,
-                    exc,
-                )
-        return None
-
-    def _set_slack_thread_strict(
-        self,
-        *,
-        team_id: str,
-        channel_id: str,
-        thread_ts: str,
-        user_id: str,
-        message_ts: str,
-        matched_pattern: str,
-    ) -> None:
-        state = self._load_slack_thread_routing_state()
-        key = self._slack_thread_routing_key(team_id, channel_id, thread_ts)
-        state[key] = {
-            "mode": "strict_mention",
-            "team_id": team_id,
-            "channel_id": channel_id,
-            "thread_ts": thread_ts,
-            "set_at": time.time(),
-            "set_by_user": user_id,
-            "set_by_message_ts": message_ts,
-            "matched_pattern": matched_pattern,
-        }
-        if len(state) > self._THREAD_ROUTING_STATE_MAX:
-            ordered = sorted(
-                state.items(),
-                key=lambda item: (
-                    float(item[1].get("set_at", 0.0))
-                    if isinstance(item[1], dict)
-                    else 0.0
-                ),
-            )
-            for old_key, _ in ordered[: len(state) - self._THREAD_ROUTING_STATE_MAX]:
-                state.pop(old_key, None)
-        self._write_slack_thread_routing_state(state)
-
-    def _clear_slack_thread_strict(
-        self, *, team_id: str, channel_id: str, thread_ts: str
-    ) -> None:
-        state = self._load_slack_thread_routing_state()
-        key = self._slack_thread_routing_key(team_id, channel_id, thread_ts)
-        if key in state:
-            state.pop(key, None)
-            self._write_slack_thread_routing_state(state)
-
-    def _is_slack_thread_strict(
-        self, *, team_id: str, channel_id: str, thread_ts: str
-    ) -> bool:
-        state = self._load_slack_thread_routing_state()
-        value = state.get(
-            self._slack_thread_routing_key(team_id, channel_id, thread_ts)
-        )
-        return isinstance(value, dict) and value.get("mode") == "strict_mention"
-
-    @staticmethod
-    def _slack_text_mentions_other_user(text: str, bot_uid: Optional[str]) -> bool:
-        mentioned_users = set(
-            re.findall(r"<@([A-Z0-9][A-Z0-9._-]*)>", text or "")
-        )
-        if bot_uid:
-            mentioned_users.discard(bot_uid)
-        return bool(mentioned_users)
 
     def _has_active_session_for_thread(
         self,
@@ -8609,27 +8712,25 @@ class SlackAdapter(BasePlatformAdapter):
         when there is no leading user mention, or for channel/broadcast tokens
         (``<!here>``, ``<#C…>``) which address the room rather than a person.
         """
-        if not text:
+        stripped = (text or "").lstrip()
+        if not stripped.startswith("<@"):
             return False
-        match = re.match(r"\s*<@([^>|\s]+)(?:\|[^>]*)?>", text)
-        if not match:
+        close = stripped.find(">", 2)
+        if close < 0:
             return False
-        return match.group(1) not in self_uids
+        mentioned = slack_user_mentions(stripped[: close + 1])
+        return len(mentioned) == 1 and mentioned.isdisjoint(self_uids)
 
     def _slack_message_mentions_self(self, text: str, self_uids: set) -> bool:
         """Return True when ``text`` @-mentions this bot anywhere in the message.
 
         Matches both mention markups — ``<@U123>`` and the pipe form
         ``<@U123|name>`` — so the ignore_other_user_mentions gate treats a
-        pipe-form bot mention as "also mentioned" even though the exact-markup
-        ``is_mentioned`` check only recognises ``<@U123>``.
+        pipe-form bot mention as "also mentioned". It shares the bounded parser
+        used by bot-event and thread-routing gates so malformed markup cannot be
+        classified differently at separate stages.
         """
-        if not text:
-            return False
-        return any(
-            re.search(rf"<@{re.escape(uid)}(?:\|[^>]*)?>", text)
-            for uid in self_uids
-        )
+        return not slack_user_mentions(text).isdisjoint(self_uids)
 
     def _slack_free_response_channels(self) -> set:
         """Return channel IDs where no @mention is required."""
@@ -8699,7 +8800,7 @@ class SlackAdapter(BasePlatformAdapter):
             return {part.strip() for part in raw.split(",") if part.strip()}
         return set()
 
-    def _slack_mention_patterns(self) -> List["re.Pattern"]:
+    def _slack_mention_patterns(self) -> tuple[tuple[str, "re.Pattern[str]"], ...]:
         """Compile optional regex wake-word patterns for channel triggers.
 
         Parity with the other adapters (Telegram, DingTalk, Mattermost,
@@ -8727,21 +8828,14 @@ class SlackAdapter(BasePlatformAdapter):
         if isinstance(patterns, str):
             patterns = [patterns]
 
-        compiled: List["re.Pattern"] = []
-        if isinstance(patterns, list):
-            for pat in patterns:
-                if not isinstance(pat, str) or not pat.strip():
-                    continue
-                try:
-                    compiled.append(re.compile(pat, re.IGNORECASE))
-                except re.error as exc:
-                    logger.warning("[Slack] Invalid mention pattern %r: %s", pat, exc)
-        elif patterns is not None:
+        if patterns is not None and not isinstance(patterns, list):
             logger.warning(
                 "[Slack] mention_patterns must be a list or string; got %s",
                 type(patterns).__name__,
             )
+            patterns = []
 
+        compiled = compile_bounded_patterns(patterns, kind="mention")
         if compiled:
             logger.info("[Slack] Loaded %d mention pattern(s)", len(compiled))
         self._compiled_mention_patterns = compiled
@@ -8751,7 +8845,7 @@ class SlackAdapter(BasePlatformAdapter):
         """Return True when ``text`` matches a configured wake-word pattern."""
         if not text:
             return False
-        return any(pattern.search(text) for pattern in self._slack_mention_patterns())
+        return match_bounded_pattern(self._slack_mention_patterns(), text) is not None
 
 
 # ──────────────────────────────────────────────────────────────────────────

@@ -14,7 +14,7 @@ bug). Two cooperating fixes:
 """
 
 import sys
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -93,6 +93,36 @@ async def test_handles_labelled_mention_form():
     adapter = _adapter_with_names({"U07ALICE": "Alice Example"})
     out = await adapter._humanize_user_mentions("<@U07ALICE|alice> hi", chat_id="C1")
     assert out == "@Alice Example hi"
+
+
+@pytest.mark.asyncio
+async def test_skips_entire_malformed_outer_token_before_valid_mention():
+    adapter = _make_adapter()
+    adapter._resolve_user_name = AsyncMock(
+        side_effect=lambda user_id, **_: f"name-{user_id}"
+    )
+    malformed = "<@UOTHER|prefix<@UNOPE><@UBOT>suffix>"
+
+    out = await adapter._humanize_user_mentions(
+        f"{malformed} <@WVALID|outside>", chat_id="C1", team_id="T1"
+    )
+
+    assert out == f"{malformed} @name-WVALID"
+    adapter._resolve_user_name.assert_awaited_once_with(
+        "WVALID", chat_id="C1", team_id="T1"
+    )
+
+
+@pytest.mark.asyncio
+async def test_rejects_extra_wrapper_without_resolving_inner_mention():
+    adapter = _make_adapter()
+    adapter._resolve_user_name = AsyncMock(return_value="Other User")
+    malformed = "<<@UOTHER|alice>>"
+
+    out = await adapter._humanize_user_mentions(malformed)
+
+    assert out == malformed
+    adapter._resolve_user_name.assert_not_awaited()
 
 
 # ----- _build_identity_prompt --------------------------------------------------

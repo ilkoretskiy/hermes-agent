@@ -235,6 +235,116 @@ class TestBotEventDiagnostics:
         ), debug_lines
 
 
+class TestFileSharedWorkspaceScope:
+    @pytest.mark.asyncio
+    async def test_explicit_workspace_uses_exact_client(self, adapter):
+        primary_client = adapter._app.client
+        primary_client.files_info = AsyncMock(
+            return_value={"ok": False, "error": "not_found"}
+        )
+        secondary_client = AsyncMock()
+        secondary_client.files_info = AsyncMock(
+            return_value={"ok": False, "error": "not_found"}
+        )
+        adapter._team_clients = {
+            "T_PRIMARY": primary_client,
+            "T_SECONDARY": secondary_client,
+        }
+        adapter._team_bot_user_ids = {
+            "T_PRIMARY": "U_PRIMARY_BOT",
+            "T_SECONDARY": "U_SECONDARY_BOT",
+        }
+
+        await adapter._handle_slack_file_shared(
+            {"channel_id": "C_SHARED", "file_id": "F_PRIVATE"},
+            body={"team_id": "T_SECONDARY"},
+        )
+
+        primary_client.files_info.assert_not_awaited()
+        secondary_client.files_info.assert_awaited_once_with(file="F_PRIVATE")
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_explicit_workspace_without_client_does_not_use_primary(self, adapter):
+        primary_client = adapter._app.client
+        primary_client.files_info = AsyncMock(
+            return_value={"ok": False, "error": "not_found"}
+        )
+        other_client = AsyncMock()
+        adapter._team_clients = {"T_PRIMARY": other_client}
+        adapter._team_bot_user_ids = {
+            "T_PRIMARY": "U_PRIMARY_BOT",
+            "T_SECONDARY": "U_SECONDARY_BOT",
+        }
+        adapter._team_bot_ids = {
+            "T_PRIMARY": "B_PRIMARY",
+            "T_SECONDARY": "B_SECONDARY",
+        }
+        adapter._team_bot_names = {
+            "T_PRIMARY": "primary",
+            "T_SECONDARY": "secondary",
+        }
+
+        await adapter._handle_slack_file_shared(
+            {"channel_id": "C_SHARED", "file_id": "F_PRIVATE"},
+            body={"team_id": "T_SECONDARY"},
+        )
+
+        primary_client.files_info.assert_not_awaited()
+        other_client.files_info.assert_not_awaited()
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_teamless_scoped_runtime_does_not_use_primary(self, adapter):
+        primary_client = adapter._app.client
+        primary_client.files_info = AsyncMock()
+        secondary_client = AsyncMock()
+        secondary_client.files_info = AsyncMock()
+        adapter._team_clients = {
+            "T_PRIMARY": primary_client,
+            "T_SECONDARY": secondary_client,
+        }
+        adapter._team_bot_user_ids = {
+            "T_PRIMARY": "U_PRIMARY_BOT",
+            "T_SECONDARY": "U_SECONDARY_BOT",
+        }
+        adapter._team_bot_ids = {
+            "T_PRIMARY": "B_PRIMARY",
+            "T_SECONDARY": "B_SECONDARY",
+        }
+        adapter._team_bot_names = {
+            "T_PRIMARY": "primary",
+            "T_SECONDARY": "secondary",
+        }
+
+        await adapter._handle_slack_file_shared(
+            {"channel_id": "C_SHARED", "file_id": "F_PRIVATE"}
+        )
+
+        primary_client.files_info.assert_not_awaited()
+        secondary_client.files_info.assert_not_awaited()
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_all_empty_legacy_workspace_uses_primary(self, adapter):
+        primary_client = adapter._app.client
+        primary_client.files_info = AsyncMock(
+            return_value={"ok": False, "error": "not_found"}
+        )
+        adapter._team_clients = {}
+        adapter._team_bot_user_ids = {}
+        adapter._team_bot_ids = {}
+        adapter._team_bot_names = {}
+
+        await adapter._handle_slack_file_shared(
+            {"channel_id": "C_SHARED", "file_id": "F_LEGACY"},
+            body={"team_id": "T_LEGACY"},
+        )
+
+        primary_client.files_info.assert_awaited_once_with(file="F_LEGACY")
+        adapter.handle_message.assert_not_awaited()
+
+
 # ---------------------------------------------------------------------------
 # TestSlashCommandSessionIsolation
 # ---------------------------------------------------------------------------
@@ -258,6 +368,131 @@ class TestSlashCommandSessionIsolation:
         assert event.source.chat_id == "C123"
         assert event.source.user_id == "U123"
         assert event.source.scope_id == "T123"
+
+    @pytest.mark.asyncio
+    async def test_exact_workspace_client_routes_scoped_slash_command(self, adapter):
+        primary_client = adapter._app.client
+        adapter._team_clients = {"T123": primary_client}
+        adapter._team_bot_user_ids = {"T123": "U_BOT"}
+        adapter._team_bot_ids = {"T123": "B_BOT"}
+        adapter._team_bot_names = {"T123": "hermes"}
+
+        await adapter._handle_slash_command({
+            "command": "/q",
+            "text": "hello",
+            "user_id": "U123",
+            "channel_id": "C123",
+            "team_id": "T123",
+        })
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.source.scope_id == "T123"
+
+    @pytest.mark.asyncio
+    async def test_explicit_workspace_without_client_suppresses_slash_command(
+        self, adapter
+    ):
+        primary_client = adapter._app.client
+        adapter._team_clients = {"T_PRIMARY": primary_client}
+        adapter._team_bot_user_ids = {
+            "T_PRIMARY": "U_PRIMARY_BOT",
+            "T_SECONDARY": "U_SECONDARY_BOT",
+        }
+        adapter._team_bot_ids = {
+            "T_PRIMARY": "B_PRIMARY",
+            "T_SECONDARY": "B_SECONDARY",
+        }
+        adapter._team_bot_names = {
+            "T_PRIMARY": "primary",
+            "T_SECONDARY": "secondary",
+        }
+
+        await adapter._handle_slash_command({
+            "command": "/q",
+            "text": "private question",
+            "user_id": "U_SECONDARY_USER",
+            "channel_id": "C_SHARED",
+            "team_id": "T_SECONDARY",
+            "response_url": "https://hooks.slack.test/commands/secondary",
+        })
+
+        assert "C_SHARED" not in adapter._channel_team
+        assert (
+            "T_SECONDARY",
+            "C_SHARED",
+            "U_SECONDARY_USER",
+        ) not in adapter._slash_command_contexts
+        adapter.handle_message.assert_not_awaited()
+
+
+class TestWorkspaceScopedInteractiveGate:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("action_kind", ("slash_confirm", "approval", "clarify"))
+    async def test_explicit_workspace_without_client_suppresses_control_action(
+        self, adapter, action_kind
+    ):
+        primary_client = adapter._app.client
+        primary_client.chat_update = AsyncMock()
+        primary_client.chat_postMessage = AsyncMock()
+        adapter._team_clients = {"T_PRIMARY": primary_client}
+        adapter._team_bot_user_ids = {
+            "T_PRIMARY": "U_PRIMARY_BOT",
+            "T_SECONDARY": "U_SECONDARY_BOT",
+        }
+        adapter._team_bot_ids = {
+            "T_PRIMARY": "B_PRIMARY",
+            "T_SECONDARY": "B_SECONDARY",
+        }
+        adapter._team_bot_names = {
+            "T_PRIMARY": "primary",
+            "T_SECONDARY": "secondary",
+        }
+        adapter._is_interactive_user_authorized = MagicMock(return_value=True)
+        ack = AsyncMock()
+        body = {
+            "team_id": "T_SECONDARY",
+            "message": {"ts": "172.000", "blocks": []},
+            "channel": {"id": "C_SHARED"},
+            "user": {"name": "operator", "id": "U_OPERATOR"},
+        }
+        marker = None
+
+        if action_kind == "slash_confirm":
+            action = {
+                "action_id": "hermes_confirm_once",
+                "value": "session-key|confirm-id",
+            }
+            resolver = AsyncMock(return_value="ok")
+            target = "tools.slash_confirm.resolve"
+            handler = adapter._handle_slash_confirm_action
+        elif action_kind == "approval":
+            marker = adapter._workspace_message_marker("T_SECONDARY", "172.000")
+            adapter._approval_resolved[marker] = False
+            action = {"action_id": "hermes_approve_once", "value": "session-key"}
+            resolver = MagicMock(return_value=1)
+            target = "tools.approval.resolve_gateway_approval"
+            handler = adapter._handle_approval_action
+        else:
+            adapter._clarify_resolved["172.000"] = False
+            action = {"action_id": "hermes_clarify_choice", "value": "clarify-id|0"}
+            resolver = MagicMock(return_value=True)
+            target = "tools.clarify_gateway.resolve_gateway_clarify"
+            handler = adapter._handle_clarify_action
+
+        with patch(target, new=resolver):
+            await handler(ack, body, action)
+
+        ack.assert_awaited_once()
+        adapter._is_interactive_user_authorized.assert_not_called()
+        assert resolver.call_count == 0
+        primary_client.chat_update.assert_not_awaited()
+        primary_client.chat_postMessage.assert_not_awaited()
+        if action_kind == "approval":
+            assert marker is not None
+            assert adapter._approval_resolved[marker] is False
+        elif action_kind == "clarify":
+            assert adapter._clarify_resolved["172.000"] is False
 
 
 class TestSlackWorkspaceCollisionIsolation:
@@ -293,6 +528,232 @@ class TestSlackWorkspaceCollisionIsolation:
         assert adapter._channel_teams["D_SHARED"] == {"T_ONE", "T_TWO"}
         assert "D_SHARED" not in adapter._channel_team
 
+    @pytest.mark.asyncio
+    async def test_teamless_dm_in_scoped_runtime_is_suppressed_before_lookup(
+        self, adapter
+    ):
+        primary_client = adapter._app.client
+        secondary_client = AsyncMock()
+        secondary_client.users_info = AsyncMock()
+        adapter._team_clients = {
+            "T_ONE": primary_client,
+            "T_TWO": secondary_client,
+        }
+        adapter._team_bot_user_ids = {
+            "T_ONE": "U_BOT_ONE",
+            "T_TWO": "U_BOT_TWO",
+        }
+        adapter._team_bot_ids = {"T_ONE": "B_ONE", "T_TWO": "B_TWO"}
+        adapter._team_bot_names = {"T_ONE": "one", "T_TWO": "two"}
+
+        await adapter._handle_slack_message({
+            "text": "teamless private message",
+            "user": "U_SHARED",
+            "channel": "D_SHARED",
+            "channel_type": "im",
+            "ts": "172.000",
+        })
+
+        primary_client.users_info.assert_not_awaited()
+        secondary_client.users_info.assert_not_awaited()
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rejected_workspace_event_does_not_consume_dedup_identity(
+        self, adapter
+    ):
+        primary_client = adapter._app.client
+        secondary_client = AsyncMock()
+        secondary_client.users_info = AsyncMock(
+            return_value={
+                "user": {
+                    "is_bot": False,
+                    "profile": {"display_name": "Secondary User"},
+                }
+            }
+        )
+        adapter._team_clients = {"T_PRIMARY": primary_client}
+        adapter._team_bot_user_ids = {
+            "T_PRIMARY": "U_PRIMARY_BOT",
+            "T_SECONDARY": "U_SECONDARY_BOT",
+        }
+        adapter._team_bot_ids = {
+            "T_PRIMARY": "B_PRIMARY",
+            "T_SECONDARY": "B_SECONDARY",
+        }
+        adapter._team_bot_names = {
+            "T_PRIMARY": "primary",
+            "T_SECONDARY": "secondary",
+        }
+        event = {
+            "type": "message",
+            "team": "T_SECONDARY",
+            "channel": "C_SHARED",
+            "channel_type": "channel",
+            "user": "U_SECONDARY_USER",
+            "client_msg_id": "M_SECONDARY",
+            "ts": "173.000",
+            "text": "<@U_SECONDARY_BOT> request",
+        }
+
+        await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_not_awaited()
+
+        adapter._team_clients["T_SECONDARY"] = secondary_client
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_awaited_once()
+        delivered = adapter.handle_message.await_args.args[0]
+        assert delivered.source.scope_id == "T_SECONDARY"
+        primary_client.users_info.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_parent_mention_wake_reuses_same_workspace_channel_marker(
+        self, adapter
+    ):
+        adapter._team_bot_user_ids = {"T_ONE": "U_BOT_ONE"}
+        adapter._has_active_session_for_thread = MagicMock(return_value=False)
+        adapter._bot_authored_thread_root = AsyncMock(return_value=False)
+        adapter._fetch_thread_parent_text = AsyncMock(
+            return_value="<@U_BOT_ONE> wait for reply"
+        )
+
+        first = await adapter._should_wake_on_unmentioned_message(
+            "174.000",
+            "C_SHARED",
+            "U_USER",
+            True,
+            team_id="T_ONE",
+        )
+        adapter._fetch_thread_parent_text.reset_mock()
+        adapter._fetch_thread_parent_text.return_value = "no mention"
+        second = await adapter._should_wake_on_unmentioned_message(
+            "174.000",
+            "C_SHARED",
+            "U_USER",
+            True,
+            team_id="T_ONE",
+        )
+
+        assert first is True
+        assert second is True
+        adapter._fetch_thread_parent_text.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("target_team", "target_channel"),
+        (("T_TWO", "C_SHARED"), ("T_ONE", "C_OTHER")),
+    )
+    async def test_parent_mention_wake_does_not_cross_workspace_or_channel(
+        self, adapter, target_team, target_channel
+    ):
+        adapter._team_bot_user_ids = {
+            "T_ONE": "U_BOT_ONE",
+            "T_TWO": "U_BOT_TWO",
+        }
+        adapter._has_active_session_for_thread = MagicMock(return_value=False)
+        adapter._bot_authored_thread_root = AsyncMock(return_value=False)
+        adapter._fetch_thread_parent_text = AsyncMock(
+            return_value="<@U_BOT_ONE> wait for reply"
+        )
+
+        first = await adapter._should_wake_on_unmentioned_message(
+            "175.000",
+            "C_SHARED",
+            "U_USER",
+            True,
+            team_id="T_ONE",
+        )
+        adapter._fetch_thread_parent_text.reset_mock()
+        adapter._fetch_thread_parent_text.return_value = "no mention"
+        cross_scope = await adapter._should_wake_on_unmentioned_message(
+            "175.000",
+            target_channel,
+            "U_USER",
+            True,
+            team_id=target_team,
+        )
+
+        assert first is True
+        assert cross_scope is False
+        adapter._fetch_thread_parent_text.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_bot_authored_parent_cache_does_not_cross_workspace(self, adapter):
+        adapter._team_bot_user_ids = {
+            "T_ONE": "U_SHARED_BOT",
+            "T_TWO": "U_SHARED_BOT",
+        }
+        adapter._thread_context_cache = {
+            "C_SHARED:176.000:T_ONE": MagicMock(parent_user_id="U_SHARED_BOT")
+        }
+        adapter._fetch_thread_context = AsyncMock(return_value="")
+
+        same_scope = await adapter._bot_authored_thread_root(
+            "C_SHARED", "176.000", team_id="T_ONE"
+        )
+        cross_scope = await adapter._bot_authored_thread_root(
+            "C_SHARED", "176.000", team_id="T_TWO"
+        )
+
+        assert same_scope is True
+        assert cross_scope is False
+        adapter._fetch_thread_context.assert_awaited_once_with(
+            channel_id="C_SHARED",
+            thread_ts="176.000",
+            current_ts="",
+            team_id="T_TWO",
+        )
+
+    @pytest.mark.asyncio
+    async def test_bot_message_thread_marker_is_workspace_scoped(self, adapter):
+        adapter._bot_message_ts = {("T_ONE", "177.000")}
+        adapter._team_bot_user_ids = {
+            "T_ONE": "U_BOT_ONE",
+            "T_TWO": "U_BOT_TWO",
+        }
+        adapter._has_active_session_for_thread = MagicMock(return_value=False)
+        adapter._bot_authored_thread_root = AsyncMock(return_value=False)
+        adapter._fetch_thread_parent_text = AsyncMock(return_value="")
+
+        same_scope = await adapter._should_wake_on_unmentioned_message(
+            "177.000",
+            "C_SHARED",
+            "U_USER",
+            True,
+            team_id="T_ONE",
+        )
+        cross_scope = await adapter._should_wake_on_unmentioned_message(
+            "177.000",
+            "C_SHARED",
+            "U_USER",
+            True,
+            team_id="T_TWO",
+        )
+
+        assert same_scope is True
+        assert cross_scope is False
+
+    def test_scoped_mentioned_thread_cap_evicts_oldest_timestamps(self, adapter):
+        adapter._MENTIONED_THREADS_MAX = 4
+        adapter._mentioned_threads.update(
+            {
+                ("T_ONE", "C_ONE", "1000.000002"),
+                ("T_ONE", "C_ONE", "999.999999"),
+                ("T_TWO", "C_ONE", "1000.000004"),
+                ("T_ONE", "C_TWO", "1000.000001"),
+                ("T_TWO", "C_TWO", "1000.000003"),
+            }
+        )
+
+        adapter._trim_mentioned_threads()
+
+        assert adapter._mentioned_threads == {
+            ("T_ONE", "C_ONE", "1000.000002"),
+            ("T_TWO", "C_TWO", "1000.000003"),
+            ("T_TWO", "C_ONE", "1000.000004"),
+        }
+
 
 # ---------------------------------------------------------------------------
 # TestAppMentionHandler
@@ -309,6 +770,7 @@ class TestAppMentionHandler:
 
         # Track which events get registered
         registered_events = []
+        registered_handlers = {}
         registered_commands = []
 
         mock_app = MagicMock()
@@ -316,6 +778,7 @@ class TestAppMentionHandler:
         def mock_event(event_type):
             def decorator(fn):
                 registered_events.append(event_type)
+                registered_handlers[event_type] = fn
                 return fn
 
             return decorator
@@ -336,6 +799,7 @@ class TestAppMentionHandler:
                 "user": "testbot",
             }
         )
+        adapter._handle_slack_reaction = AsyncMock()
 
         # Mock AsyncWebClient so multi-workspace auth_test is awaitable
         mock_web_client = AsyncMock()
@@ -371,6 +835,22 @@ class TestAppMentionHandler:
         assert "reaction_removed" in registered_events
         assert "assistant_thread_started" in registered_events
         assert "assistant_thread_context_changed" in registered_events
+        reaction_event = {"type": "reaction_added"}
+        reaction_body = {"team_id": "T_BODY"}
+        asyncio.run(
+            registered_handlers["reaction_added"](
+                reaction_event, MagicMock(), reaction_body
+            )
+        )
+        asyncio.run(
+            registered_handlers["reaction_removed"](
+                reaction_event, MagicMock(), reaction_body
+            )
+        )
+        assert adapter._handle_slack_reaction.await_args_list == [
+            call(reaction_event, reaction_body),
+            call(reaction_event, reaction_body, removed=True),
+        ]
         # Slack slash commands are registered via a single regex matcher
         # covering every COMMAND_REGISTRY entry (e.g. /hermes, /btw, /stop,
         # /model, ...) so users get native-slash parity with Discord and
@@ -575,6 +1055,8 @@ class TestSlackConnectCleanup:
         adapter._app.client = primary_client
         adapter._team_clients = {"T_FAKE": team_client}
         adapter._team_bot_user_ids = {"T_FAKE": "U_BOT"}
+        adapter._team_bot_ids = {"T_FAKE": "B_BOT"}
+        adapter._team_bot_names = {"T_FAKE": "hermes"}
         adapter._channel_team = {"C_FAKE": "T_FAKE"}
         adapter._platform_lock_scope = "slack-app-token"
         adapter._platform_lock_identity = "xapp-fake"
@@ -594,6 +1076,8 @@ class TestSlackConnectCleanup:
         assert adapter._socket_mode_task is None
         assert adapter._team_clients == {}
         assert adapter._team_bot_user_ids == {}
+        assert adapter._team_bot_ids == {}
+        assert adapter._team_bot_names == {}
         assert adapter._channel_team == {}
         assert adapter._bot_user_id is None
         assert adapter._app_token is None
@@ -641,7 +1125,7 @@ class TestSlackSocketWatchdog:
 
         return FakeHandler, instances
 
-    def _patch_stack(self, fake_factory):
+    def _patch_stack(self, fake_factory, auth_response=None):
         """Return a list of patcher context managers to keep active for the test."""
         mock_app = MagicMock()
 
@@ -660,10 +1144,13 @@ class TestSlackSocketWatchdog:
         mock_web_client.auth_test = AsyncMock(
             return_value={
                 "user_id": "U_BOT",
+                "bot_id": "B_BOT",
                 "user": "testbot",
                 "team_id": "T_FAKE",
                 "team": "FakeTeam",
             }
+            if auth_response is None
+            else auth_response
         )
 
         return [
@@ -785,6 +1272,7 @@ class TestSlackSocketWatchdog:
         adapter._bot_user_id = "U_OLD_BOT"
         adapter._team_clients = {"T_OLD": MagicMock(name="old-client")}
         adapter._team_bot_user_ids = {"T_OLD": "U_OLD_BOT"}
+        adapter._team_bot_ids = {"T_OLD": "B_OLD_BOT"}
 
         with contextlib.ExitStack() as stack:
             for p in self._patch_stack(factory):
@@ -797,8 +1285,62 @@ class TestSlackSocketWatchdog:
                 assert adapter._bot_user_id == "U_BOT"
                 assert "T_OLD" not in adapter._team_clients
                 assert "T_OLD" not in adapter._team_bot_user_ids
+                assert "T_OLD" not in adapter._team_bot_ids
                 assert "T_FAKE" in adapter._team_clients
                 assert adapter._team_bot_user_ids["T_FAKE"] == "U_BOT"
+                assert adapter._team_bot_ids["T_FAKE"] == "B_BOT"
+            finally:
+                await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_missing_auth_bot_id_fails_closed_for_userless_bot_events(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-test")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        fake_factory, _instances = self._make_fake_handler_factory()
+        auth_response = {
+            "user_id": "U_BOT",
+            "user": "testbot",
+            "team_id": "T_FAKE",
+            "team": "FakeTeam",
+        }
+        adapter = SlackAdapter(
+            PlatformConfig(
+                enabled=True,
+                token="xoxb-test",
+                extra={"app_token_env": "SLACK_APP_TOKEN", "require_mention": False},
+            )
+        )
+        adapter.handle_message = AsyncMock()
+
+        with contextlib.ExitStack() as stack:
+            for patcher in self._patch_stack(fake_factory, auth_response):
+                stack.enter_context(patcher)
+
+            try:
+                assert await adapter.connect() is True
+                assert adapter._team_bot_user_ids == {"T_FAKE": "U_BOT"}
+                assert adapter._team_bot_ids == {}
+
+                for allow_bots in ("all", "mentions"):
+                    adapter.config.extra["allow_bots"] = allow_bots
+                    adapter.handle_message.reset_mock()
+                    event = {
+                        "type": "message",
+                        "subtype": "bot_message",
+                        "bot_id": "B_UNRESOLVED",
+                        "channel": "C1",
+                        "channel_type": "channel",
+                        "team": "T_FAKE",
+                        "ts": "1710000001.000099",
+                        "text": "<@U_BOT> unresolved identity",
+                    }
+
+                    await adapter._handle_slack_message(event)
+
+                    adapter.handle_message.assert_not_awaited()
             finally:
                 await adapter.disconnect()
 
@@ -1870,6 +2412,7 @@ class TestMessageRouting:
         adapter.config.extra.update({"require_mention": True, "strict_mention": True})
         adapter._bot_display_name = "TestBot"
         adapter._team_bot_names = {"T123": "WorkspaceBot"}
+        adapter._team_clients = {"T123": adapter._app.client}
         event = {
             "text": "<@U_BOT> Hi",
             "user": "U_USER",
@@ -2659,6 +3202,7 @@ class TestThreadReplyHandling:
             }
         )
         a._bot_user_id = "U_BOT"
+        a._team_clients = {"T_TEAM": a._app.client}
         a._team_bot_user_ids = {"T_TEAM": "U_BOT"}
         a._running = True
         a.handle_message = AsyncMock()
@@ -2749,7 +3293,11 @@ class TestThreadReplyHandling:
         # Cold-start context carries the parent so the agent sees the ask.
         assert "check this and ask me for run" in msg_event.channel_context
         # Thread remembered so later replies skip the parent fetch.
-        assert "123.000" in adapter_with_session_store._mentioned_threads
+        assert (
+            "T_TEAM",
+            "C123",
+            "123.000",
+        ) in adapter_with_session_store._mentioned_threads
 
     @pytest.mark.asyncio
     async def test_top_level_mention_registers_thread_for_replies(
@@ -2773,11 +3321,10 @@ class TestThreadReplyHandling:
         })
 
         adapter_with_session_store.handle_message.assert_called_once()
-        # Workspace-scoped marker (#20583): the event carries team T_TEAM, so
-        # the registered marker is (team_id, ts) — identical thread ts values
-        # in two workspaces must never wake each other's bot.
+        # Slack-local thread routing evidence is scoped by workspace and channel.
         assert (
             "T_TEAM",
+            "C123",
             "555.000",
         ) in adapter_with_session_store._mentioned_threads
 
@@ -2872,7 +3419,14 @@ class TestAssistantThreadLifecycle:
             }
         )
         a._bot_user_id = "U_BOT"
-        a._team_bot_user_ids = {"T_TEAM": "U_BOT"}
+        a._team_clients = {
+            "T_TEAM": a._app.client,
+            "T_OTHER": a._app.client,
+        }
+        a._team_bot_user_ids = {
+            "T_TEAM": "U_BOT",
+            "T_OTHER": "U_BOT",
+        }
         a._running = True
         a.handle_message = AsyncMock()
         a.set_session_store(mock_session_store)
@@ -2931,6 +3485,14 @@ class TestAssistantThreadLifecycle:
         self, assistant_adapter
     ):
         """Slack Connect can reuse a channel/thread pair in multiple workspaces."""
+        assistant_adapter._team_clients.update({
+            "T_ONE": assistant_adapter._app.client,
+            "T_TWO": assistant_adapter._app.client,
+        })
+        assistant_adapter._team_bot_user_ids.update({
+            "T_ONE": "U_BOT",
+            "T_TWO": "U_BOT",
+        })
         for team_id, user_id in (("T_ONE", "U_ONE"), ("T_TWO", "U_TWO")):
             await assistant_adapter._handle_assistant_thread_lifecycle_event(
                 {
@@ -2956,6 +3518,92 @@ class TestAssistantThreadLifecycle:
         assert assistant_adapter._lookup_assistant_thread_metadata(
             {}, channel_id="D_SHARED", thread_ts="171.000", team_id="T_TWO"
         )["user_id"] == "U_TWO"
+
+    @pytest.mark.asyncio
+    async def test_explicit_workspace_without_client_suppresses_lifecycle_state(
+        self, assistant_adapter, mock_session_store
+    ):
+        primary_client = assistant_adapter._app.client
+        primary_client.assistant_threads_setSuggestedPrompts = AsyncMock()
+        assistant_adapter.config.extra["suggested_prompts"] = [
+            {"title": "Plan", "message": "Help me plan"}
+        ]
+        assistant_adapter._team_clients = {"T_TEAM": primary_client}
+        assistant_adapter._team_bot_user_ids["T_MISSING"] = "U_MISSING_BOT"
+        assistant_adapter._team_bot_ids = {
+            "T_TEAM": "B_TEAM",
+            "T_MISSING": "B_MISSING",
+        }
+        assistant_adapter._team_bot_names = {
+            "T_TEAM": "team",
+            "T_MISSING": "missing",
+        }
+
+        await assistant_adapter._handle_assistant_thread_lifecycle_event(
+            {
+                "type": "assistant_thread_started",
+                "assistant_thread": {
+                    "channel_id": "D_SHARED",
+                    "thread_ts": "172.000",
+                    "user_id": "U_MISSING_USER",
+                },
+            },
+            {"team_id": "T_MISSING"},
+        )
+
+        assert ("T_MISSING", "D_SHARED", "172.000") not in (
+            assistant_adapter._assistant_threads
+        )
+        assert "D_SHARED" not in assistant_adapter._channel_team
+        mock_session_store.get_or_create_session.assert_not_called()
+        primary_client.assistant_threads_setSuggestedPrompts.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("event_type", ("app_context_changed", "app_home_opened"))
+    async def test_explicit_workspace_without_client_suppresses_agent_lifecycle_state(
+        self, assistant_adapter, mock_session_store, event_type
+    ):
+        primary_client = assistant_adapter._app.client
+        primary_client.assistant_threads_setSuggestedPrompts = AsyncMock()
+        assistant_adapter.config.extra["suggested_prompts"] = [
+            {"title": "Plan", "message": "Help me plan"}
+        ]
+        assistant_adapter._team_clients = {"T_TEAM": primary_client}
+        assistant_adapter._team_bot_user_ids["T_MISSING"] = "U_MISSING_BOT"
+        assistant_adapter._team_bot_ids = {
+            "T_TEAM": "B_TEAM",
+            "T_MISSING": "B_MISSING",
+        }
+        assistant_adapter._team_bot_names = {
+            "T_TEAM": "team",
+            "T_MISSING": "missing",
+        }
+        assistant_adapter._agent_view_contexts = {}
+
+        if event_type == "app_home_opened":
+            await assistant_adapter._handle_app_home_opened(
+                {
+                    "type": event_type,
+                    "tab": "messages",
+                    "channel": "D_SHARED",
+                    "user": "U_MISSING_USER",
+                },
+                {"team_id": "T_MISSING"},
+            )
+        else:
+            await assistant_adapter._handle_app_context_changed(
+                {
+                    "type": event_type,
+                    "user": "U_MISSING_USER",
+                    "context": {"channel_id": "C_ACTIVE"},
+                },
+                {"team_id": "T_MISSING"},
+            )
+
+        assert assistant_adapter._agent_view_contexts == {}
+        assert "D_SHARED" not in assistant_adapter._channel_team
+        mock_session_store.get_or_create_session.assert_not_called()
+        primary_client.assistant_threads_setSuggestedPrompts.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_agent_view_message_preserves_outer_team_and_turn_context(
@@ -4357,6 +5005,7 @@ class TestThreadImageContext:
             }
         )
         a._bot_user_id = "U_BOT"
+        a._team_clients = {"T_TEAM": a._app.client}
         a._team_bot_user_ids = {"T_TEAM": "U_BOT"}
         a._running = True
         a.handle_message = AsyncMock()

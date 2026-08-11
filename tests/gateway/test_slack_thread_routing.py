@@ -5,8 +5,11 @@ Slack adapter implementation exists. They are meant to be reviewed first, then
 implemented with TDD one behavior slice at a time.
 """
 
+import asyncio
 import json
 import sys
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import MessageType
 from gateway.session import SessionEntry, SessionSource, build_session_key
 
 
@@ -60,9 +64,14 @@ import plugins.platforms.slack.adapter as _slack_mod  # noqa: E402
 _slack_mod.SLACK_AVAILABLE = True
 
 from plugins.platforms.slack.adapter import SlackAdapter  # noqa: E402
+from plugins.platforms.slack.thread_routing import (  # noqa: E402
+    RoutingDecision,
+    RoutingDisposition,
+)
 
 
 BOT_USER_ID = "U_BOT"
+BOT_ID = "B_BOT"
 USER_ID = "U_USER"
 OTHER_USER_ID = "U_OTHER"
 TEAM_ID = "T1"
@@ -111,7 +120,12 @@ def adapter(hermes_home):
     }
     slack_adapter._app.client.conversations_replies.return_value = {"messages": []}
     slack_adapter._bot_user_id = BOT_USER_ID
+    slack_adapter._team_clients = {
+        TEAM_ID: slack_adapter._app.client,
+        OTHER_TEAM_ID: slack_adapter._app.client,
+    }
     slack_adapter._team_bot_user_ids = {TEAM_ID: BOT_USER_ID, OTHER_TEAM_ID: BOT_USER_ID}
+    slack_adapter._team_bot_ids = {TEAM_ID: BOT_ID, OTHER_TEAM_ID: "B_SECONDARY"}
     slack_adapter._running = True
     slack_adapter.handle_message = AsyncMock()
     return slack_adapter
@@ -289,6 +303,535 @@ class TestNormalModeBaseline:
         adapter.handle_message.assert_awaited_once()
 
 
+class TestWorkspaceScopedBotGate:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "mention",
+        (f"<@{BOT_USER_ID}>", f"<@{BOT_USER_ID}|hermes>"),
+    )
+    async def test_primary_workspace_peer_bot_semantic_mentions_route(
+        self, adapter, mention
+    ):
+        adapter.config.extra["allow_bots"] = "mentions"
+        event = make_event(f"{mention} check this", user="U_PEER_BOT")
+        event["bot_id"] = "B_PEER"
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_secondary_workspace_peer_bot_mention_routes(self, adapter):
+        adapter.config.extra["allow_bots"] = "mentions"
+        secondary_bot_id = "U_SECONDARY_BOT"
+        adapter._team_bot_user_ids[OTHER_TEAM_ID] = secondary_bot_id
+        event = make_event(
+            f"<@{secondary_bot_id}> check this",
+            team=OTHER_TEAM_ID,
+            user="U_PEER_BOT",
+        )
+        event["bot_id"] = "B_PEER"
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_secondary_workspace_blockkit_peer_bot_mention_routes(self, adapter):
+        adapter.config.extra["allow_bots"] = "mentions"
+        secondary_bot_id = "U_SECONDARY_BOT"
+        adapter._team_bot_user_ids[OTHER_TEAM_ID] = secondary_bot_id
+        event = make_event(
+            "Release notification",
+            team=OTHER_TEAM_ID,
+            user="U_PEER_BOT",
+        )
+        event.update({
+            "bot_id": "B_PEER",
+            "blocks": [
+                {
+                    "type": "rich_text",
+                    "elements": [
+                        {
+                            "type": "rich_text_section",
+                            "elements": [
+                                {"type": "user", "user_id": secondary_bot_id}
+                            ],
+                        }
+                    ],
+                }
+            ],
+        })
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_secondary_workspace_own_bot_message_is_suppressed(self, adapter):
+        adapter.config.extra["allow_bots"] = "all"
+        secondary_bot_id = "U_SECONDARY_BOT"
+        adapter._team_bot_user_ids[OTHER_TEAM_ID] = secondary_bot_id
+        event = make_event(
+            f"<@{secondary_bot_id}> self echo",
+            team=OTHER_TEAM_ID,
+            user=secondary_bot_id,
+        )
+        event["bot_id"] = "B_SELF"
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cached_secondary_workspace_own_bot_message_is_suppressed(
+        self, adapter
+    ):
+        adapter.config.extra["allow_bots"] = "all"
+        secondary_bot_id = "U_SECONDARY_BOT"
+        adapter._team_bot_user_ids[OTHER_TEAM_ID] = secondary_bot_id
+        adapter._channel_team[CHANNEL_ID] = OTHER_TEAM_ID
+        event = make_event(
+            f"<@{secondary_bot_id}> self echo",
+            team="",
+            user=secondary_bot_id,
+        )
+        event["bot_id"] = "B_SELF"
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_userless_secondary_workspace_own_bot_message_is_suppressed(
+        self, adapter
+    ):
+        adapter.config.extra.update({"allow_bots": "all", "require_mention": False})
+        event = make_event("self echo", team=OTHER_TEAM_ID, user="")
+        event.update({"subtype": "bot_message", "bot_id": "B_SECONDARY"})
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_userless_workspace_peer_bot_message_routes_under_allow_all(
+        self, adapter
+    ):
+        adapter.config.extra.update({"allow_bots": "all", "require_mention": False})
+        event = make_event("peer update", team=OTHER_TEAM_ID, user="")
+        event.update({"subtype": "bot_message", "bot_id": "B_PEER"})
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("allow_bots", ("all", "mentions"))
+    async def test_userless_bot_event_is_suppressed_when_own_bot_id_is_unresolved(
+        self, adapter, allow_bots
+    ):
+        adapter.config.extra.update(
+            {"allow_bots": allow_bots, "require_mention": False}
+        )
+        adapter._team_bot_ids.pop(OTHER_TEAM_ID)
+        event = make_event(
+            f"<@{BOT_USER_ID}> unresolved identity",
+            team=OTHER_TEAM_ID,
+            user="",
+        )
+        event.update({"subtype": "bot_message", "bot_id": "B_UNRESOLVED"})
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("channel_scope", ("missing", "ambiguous"))
+    async def test_unresolved_workspace_bot_event_is_suppressed(
+        self, adapter, channel_scope
+    ):
+        adapter.config.extra.update({"allow_bots": "all", "require_mention": False})
+        secondary_bot_id = "U_SECONDARY_BOT"
+        adapter._team_bot_user_ids[OTHER_TEAM_ID] = secondary_bot_id
+        if channel_scope == "ambiguous":
+            adapter._remember_channel_team(CHANNEL_ID, TEAM_ID)
+            adapter._remember_channel_team(CHANNEL_ID, OTHER_TEAM_ID)
+            assert CHANNEL_ID not in adapter._channel_team
+
+        event = make_event("self echo", team="", user=secondary_bot_id)
+        event["bot_id"] = "B_SELF"
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("channel_scope", ("missing", "ambiguous"))
+    @pytest.mark.parametrize("routing_gate", ("require_mention", "allowed_channels"))
+    async def test_unresolved_workspace_human_channel_event_is_suppressed_before_hydration(
+        self, adapter, channel_scope, routing_gate
+    ):
+        adapter._fetch_thread_context = AsyncMock(return_value="thread context")
+        adapter._download_slack_file = AsyncMock(return_value="/tmp/downloaded.txt")
+        adapter._download_slack_file_bytes = AsyncMock(return_value=b"downloaded")
+        if routing_gate == "allowed_channels":
+            adapter.config.extra.update({
+                "allowed_channels": [OTHER_CHANNEL_ID],
+                "require_mention": False,
+            })
+        if channel_scope == "ambiguous":
+            adapter._remember_channel_team(CHANNEL_ID, TEAM_ID)
+            adapter._remember_channel_team(CHANNEL_ID, OTHER_TEAM_ID)
+            assert CHANNEL_ID not in adapter._channel_team
+            adapter._team_bot_user_ids = {TEAM_ID: BOT_USER_ID}
+            adapter._team_bot_ids = {TEAM_ID: BOT_ID}
+
+        await adapter._handle_slack_message(
+            make_event(
+                "ordinary unmentioned human text",
+                team="",
+                files=[
+                    {
+                        "id": "F1",
+                        "name": "note.txt",
+                        "mimetype": "text/plain",
+                        "filetype": "text",
+                        "url_private_download": "https://files.slack.test/F1",
+                        "size": 12,
+                    }
+                ],
+            )
+        )
+
+        adapter._app.client.users_info.assert_not_awaited()
+        adapter._fetch_thread_context.assert_not_awaited()
+        adapter._download_slack_file.assert_not_awaited()
+        adapter._download_slack_file_bytes.assert_not_awaited()
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_body_only_workspace_scope_uses_scoped_client_for_bot_lookup(
+        self, adapter
+    ):
+        secondary_bot_uid = "U_SECONDARY_BOT"
+        primary_client = adapter._app.client
+        secondary_client = AsyncMock()
+        secondary_client.users_info.return_value = {
+            "user": {
+                "name": "secondary-user",
+                "profile": {"display_name": "Secondary User"},
+            }
+        }
+        secondary_client.conversations_replies.return_value = {"messages": []}
+        adapter._team_clients = {
+            TEAM_ID: primary_client,
+            OTHER_TEAM_ID: secondary_client,
+        }
+        adapter._team_bot_user_ids[OTHER_TEAM_ID] = secondary_bot_uid
+
+        await adapter._handle_slack_message(
+            make_event(f"<@{secondary_bot_uid}> scoped request", team=""),
+            payload={"team_id": OTHER_TEAM_ID},
+        )
+
+        primary_client.users_info.assert_not_awaited()
+        secondary_client.users_info.assert_awaited_once_with(user=USER_ID)
+        adapter.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_unique_registered_workspace_scope_is_propagated_to_lookup_and_source(
+        self, adapter
+    ):
+        secondary_bot_uid = "U_SECONDARY_BOT"
+        primary_client = adapter._app.client
+        secondary_client = AsyncMock()
+        secondary_client.users_info.return_value = {
+            "user": {
+                "name": "secondary-user",
+                "profile": {"display_name": "Secondary User"},
+            }
+        }
+        secondary_client.conversations_replies.return_value = {"messages": []}
+        adapter._team_clients = {OTHER_TEAM_ID: secondary_client}
+        adapter._team_bot_user_ids = {OTHER_TEAM_ID: secondary_bot_uid}
+        adapter._team_bot_ids = {OTHER_TEAM_ID: "B_SECONDARY"}
+
+        await adapter._handle_slack_message(
+            make_event(f"<@{secondary_bot_uid}> scoped request", team="")
+        )
+
+        primary_client.users_info.assert_not_awaited()
+        assert secondary_client.users_info.await_count >= 1
+        adapter.handle_message.assert_awaited_once()
+        msg_event = adapter.handle_message.await_args.args[0]
+        assert msg_event.source.scope_id == OTHER_TEAM_ID
+
+    @pytest.mark.asyncio
+    async def test_explicit_workspace_without_registered_client_is_suppressed(
+        self, adapter
+    ):
+        secondary_bot_uid = "U_SECONDARY_BOT"
+        primary_client = adapter._app.client
+        adapter._team_clients = {TEAM_ID: primary_client}
+        adapter._team_bot_user_ids[OTHER_TEAM_ID] = secondary_bot_uid
+        adapter._fetch_thread_context = AsyncMock(return_value="thread context")
+
+        await adapter._handle_slack_message(
+            make_event(f"<@{secondary_bot_uid}> scoped request", team=""),
+            payload={"team_id": OTHER_TEAM_ID},
+        )
+
+        primary_client.users_info.assert_not_awaited()
+        primary_client.conversations_replies.assert_not_awaited()
+        adapter._fetch_thread_context.assert_not_awaited()
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_explicit_workspace_with_empty_client_registry_and_known_identities_is_suppressed(
+        self, adapter
+    ):
+        primary_client = adapter._app.client
+        adapter._team_clients = {}
+        adapter._team_bot_user_ids = {
+            TEAM_ID: BOT_USER_ID,
+            OTHER_TEAM_ID: "U_SECONDARY_BOT",
+        }
+        adapter._team_bot_ids = {
+            TEAM_ID: BOT_ID,
+            OTHER_TEAM_ID: "B_SECONDARY",
+        }
+        adapter._fetch_thread_context = AsyncMock(return_value="thread context")
+
+        await adapter._handle_slack_message(
+            make_event("scoped request", team=""),
+            payload={"team_id": OTHER_TEAM_ID},
+        )
+
+        primary_client.users_info.assert_not_awaited()
+        primary_client.conversations_replies.assert_not_awaited()
+        adapter._fetch_thread_context.assert_not_awaited()
+        adapter.handle_message.assert_not_awaited()
+
+
+class TestWorkspaceScopedReactionGate:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("channel_scope", ("missing", "ambiguous"))
+    async def test_unresolved_reaction_is_suppressed_before_hook_or_lookup(
+        self, adapter, channel_scope
+    ):
+        adapter.config.extra["reaction_triggers"] = ["thumbsup"]
+        primary_client = AsyncMock()
+        secondary_client = AsyncMock()
+        primary_client.conversations_replies.return_value = {"messages": []}
+        secondary_client.conversations_replies.return_value = {"messages": []}
+        adapter._team_clients = {
+            TEAM_ID: primary_client,
+            OTHER_TEAM_ID: secondary_client,
+        }
+        adapter._team_bot_user_ids[OTHER_TEAM_ID] = "U_SECONDARY_BOT"
+        adapter._reaction_handler = AsyncMock()
+        adapter._handle_slack_message = AsyncMock()
+        if channel_scope == "ambiguous":
+            adapter._remember_channel_team(CHANNEL_ID, TEAM_ID)
+            adapter._remember_channel_team(CHANNEL_ID, OTHER_TEAM_ID)
+            assert CHANNEL_ID not in adapter._channel_team
+
+        await adapter._handle_slack_reaction({
+            "type": "reaction_added",
+            "user": USER_ID,
+            "reaction": "thumbsup",
+            "item": {
+                "type": "message",
+                "channel": CHANNEL_ID,
+                "ts": MESSAGE_TS,
+            },
+            "item_user": BOT_USER_ID,
+            "event_ts": "1710000002.000003",
+        })
+
+        adapter._reaction_handler.assert_not_awaited()
+        primary_client.conversations_replies.assert_not_awaited()
+        secondary_client.conversations_replies.assert_not_awaited()
+        adapter._handle_slack_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_explicit_reaction_workspace_without_client_is_suppressed_before_hook(
+        self, adapter
+    ):
+        adapter.config.extra["reaction_triggers"] = ["thumbsup"]
+        primary_client = AsyncMock()
+        adapter._team_clients = {TEAM_ID: primary_client}
+        adapter._team_bot_user_ids = {
+            TEAM_ID: BOT_USER_ID,
+            OTHER_TEAM_ID: "U_SECONDARY_BOT",
+        }
+        adapter._reaction_handler = AsyncMock()
+        adapter._handle_slack_message = AsyncMock()
+
+        await adapter._handle_slack_reaction(
+            {
+                "type": "reaction_added",
+                "user": USER_ID,
+                "reaction": "thumbsup",
+                "item": {
+                    "type": "message",
+                    "channel": CHANNEL_ID,
+                    "ts": MESSAGE_TS,
+                },
+                "item_user": "U_SECONDARY_BOT",
+                "event_ts": "1710000002.000003",
+            },
+            body={"team_id": OTHER_TEAM_ID},
+        )
+
+        adapter._reaction_handler.assert_not_awaited()
+        primary_client.conversations_replies.assert_not_awaited()
+        adapter._handle_slack_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_body_only_reaction_scope_routes_with_explicit_workspace_client(
+        self, adapter
+    ):
+        adapter.config.extra["reaction_triggers"] = ["thumbsup"]
+        primary_client = AsyncMock()
+        secondary_client = AsyncMock()
+        primary_client.conversations_replies.return_value = {"messages": []}
+        secondary_client.conversations_replies.return_value = {"messages": []}
+        adapter._team_clients = {
+            TEAM_ID: primary_client,
+            OTHER_TEAM_ID: secondary_client,
+        }
+        adapter._team_bot_user_ids[OTHER_TEAM_ID] = "U_SECONDARY_BOT"
+        adapter._handle_slack_message = AsyncMock()
+        adapter._remember_channel_team(CHANNEL_ID, TEAM_ID)
+        adapter._remember_channel_team(CHANNEL_ID, OTHER_TEAM_ID)
+        assert CHANNEL_ID not in adapter._channel_team
+
+        await adapter._handle_slack_reaction(
+            {
+                "type": "reaction_added",
+                "user": USER_ID,
+                "reaction": "thumbsup",
+                "item": {
+                    "type": "message",
+                    "channel": CHANNEL_ID,
+                    "ts": MESSAGE_TS,
+                },
+                "item_user": "U_SECONDARY_BOT",
+                "event_ts": "1710000002.000003",
+            },
+            body={"team_id": OTHER_TEAM_ID},
+        )
+
+        primary_client.conversations_replies.assert_not_awaited()
+        secondary_client.conversations_replies.assert_awaited_once()
+        adapter._handle_slack_message.assert_awaited_once()
+        reaction_call = adapter._handle_slack_message.await_args
+        assert reaction_call is not None
+        synthetic = reaction_call.args[0]
+        assert synthetic["team"] == OTHER_TEAM_ID
+
+    @pytest.mark.asyncio
+    async def test_unambiguous_cached_reaction_scope_routes(self, adapter):
+        adapter.config.extra["reaction_triggers"] = ["thumbsup"]
+        primary_client = AsyncMock()
+        primary_client.conversations_replies.return_value = {"messages": []}
+        adapter._team_clients = {TEAM_ID: primary_client}
+        adapter._team_bot_user_ids = {TEAM_ID: BOT_USER_ID}
+        adapter._remember_channel_team(CHANNEL_ID, TEAM_ID)
+        adapter._handle_slack_message = AsyncMock()
+
+        await adapter._handle_slack_reaction({
+            "type": "reaction_added",
+            "user": USER_ID,
+            "reaction": "thumbsup",
+            "item": {
+                "type": "message",
+                "channel": CHANNEL_ID,
+                "ts": MESSAGE_TS,
+            },
+            "item_user": BOT_USER_ID,
+            "event_ts": "1710000002.000003",
+        })
+
+        primary_client.conversations_replies.assert_awaited_once()
+        adapter._handle_slack_message.assert_awaited_once()
+        reaction_call = adapter._handle_slack_message.await_args
+        assert reaction_call is not None
+        assert reaction_call.args[0]["team"] == TEAM_ID
+
+    @pytest.mark.asyncio
+    async def test_unique_registered_reaction_scope_routes_without_channel_cache(
+        self, adapter
+    ):
+        adapter.config.extra["reaction_triggers"] = ["thumbsup"]
+        primary_client = AsyncMock()
+        primary_client.conversations_replies.return_value = {"messages": []}
+        adapter._team_clients = {TEAM_ID: primary_client}
+        adapter._team_bot_user_ids = {TEAM_ID: BOT_USER_ID}
+        adapter._team_bot_ids = {TEAM_ID: BOT_ID}
+        adapter._team_bot_names = {TEAM_ID: "hermes"}
+        adapter._channel_team.clear()
+        adapter._channel_teams.clear()
+        adapter._reaction_handler = AsyncMock()
+        adapter._handle_slack_message = AsyncMock()
+
+        await adapter._handle_slack_reaction({
+            "type": "reaction_added",
+            "user": USER_ID,
+            "reaction": "thumbsup",
+            "item": {
+                "type": "message",
+                "channel": CHANNEL_ID,
+                "ts": MESSAGE_TS,
+            },
+            "item_user": BOT_USER_ID,
+            "event_ts": "1710000002.000003",
+        })
+
+        adapter._reaction_handler.assert_awaited_once()
+        primary_client.conversations_replies.assert_awaited_once()
+        adapter._handle_slack_message.assert_awaited_once()
+        reaction_call = adapter._handle_slack_message.await_args
+        assert reaction_call is not None
+        assert reaction_call.args[0]["team"] == TEAM_ID
+
+    @pytest.mark.asyncio
+    async def test_legacy_teamless_reaction_routes_with_primary_client(self, adapter):
+        adapter.config.extra["reaction_triggers"] = ["thumbsup"]
+        primary_client = adapter._app.client
+        primary_client.conversations_replies.return_value = {"messages": []}
+        adapter._team_clients = {}
+        adapter._team_bot_user_ids = {}
+        adapter._team_bot_ids = {}
+        adapter._team_bot_names = {}
+        adapter._channel_team.clear()
+        adapter._channel_teams.clear()
+        adapter._reaction_handler = AsyncMock()
+        adapter._handle_slack_message = AsyncMock()
+
+        await adapter._handle_slack_reaction({
+            "type": "reaction_added",
+            "user": USER_ID,
+            "reaction": "thumbsup",
+            "item": {
+                "type": "message",
+                "channel": CHANNEL_ID,
+                "ts": MESSAGE_TS,
+            },
+            "item_user": BOT_USER_ID,
+            "event_ts": "1710000002.000003",
+        })
+
+        adapter._reaction_handler.assert_awaited_once()
+        primary_client.conversations_replies.assert_awaited_once()
+        adapter._handle_slack_message.assert_awaited_once()
+        reaction_call = adapter._handle_slack_message.await_args
+        assert reaction_call is not None
+        assert "team" not in reaction_call.args[0]
+
+
 class TestConversationFlow:
     @pytest.mark.asyncio
     async def test_direct_call_then_unmentioned_stop_then_plain_message_is_suppressed(
@@ -385,6 +928,17 @@ class TestConversationFlow:
 
 class TestStopRequests:
     @pytest.mark.asyncio
+    async def test_stop_with_configured_mention_pattern_sets_strict_and_suppresses(
+        self, adapter, hermes_home
+    ):
+        adapter.config.extra["mention_patterns"] = [r"\bhermes\b"]
+
+        await adapter._handle_slack_message(make_event("hermes stop responding"))
+
+        assert read_state(hermes_home)[thread_key()]["mode"] == "strict_mention"
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_stop_with_direct_bot_mention_sets_strict_and_suppresses(
         self, adapter, hermes_home
     ):
@@ -426,6 +980,8 @@ class TestStopRequests:
             make_event("не отвечай на сообщения", channel=OTHER_CHANNEL_ID)
         )
 
+        # Unscoped/timestamp-only evidence cannot accept the control or wake a
+        # scoped workspace. It is neither persisted nor sent to the agent.
         assert read_state(hermes_home) == {}
         adapter.handle_message.assert_not_awaited()
 
@@ -478,6 +1034,18 @@ class TestStrictMode:
         assert read_state(hermes_home)[thread_key()]["mode"] == "strict_mention"
 
     @pytest.mark.asyncio
+    async def test_configured_mention_pattern_routes_without_clearing_strict(
+        self, adapter, hermes_home
+    ):
+        adapter.config.extra["mention_patterns"] = [r"\bhermes\b"]
+        write_strict_state(hermes_home)
+
+        await adapter._handle_slack_message(make_event("hermes answer this"))
+
+        adapter.handle_message.assert_awaited_once()
+        assert read_state(hermes_home)[thread_key()]["mode"] == "strict_mention"
+
+    @pytest.mark.asyncio
     async def test_other_user_mention_in_strict_thread_is_suppressed_without_bot_mention(
         self, adapter, hermes_home
     ):
@@ -485,6 +1053,28 @@ class TestStrictMode:
         set_active_session(adapter)
 
         await adapter._handle_slack_message(make_event(f"<@{OTHER_USER_ID}> можешь проверить?"))
+
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_pipe_form_bot_mention_routes_without_clearing_strict(
+        self, adapter, hermes_home
+    ):
+        write_strict_state(hermes_home)
+
+        await adapter._handle_slack_message(
+            make_event(f"<@{BOT_USER_ID}|hermes> answer this")
+        )
+
+        adapter.handle_message.assert_awaited_once()
+        assert read_state(hermes_home)[thread_key()]["mode"] == "strict_mention"
+
+    @pytest.mark.asyncio
+    async def test_strict_state_overrides_free_response_channel(self, adapter, hermes_home):
+        adapter.config.extra["require_mention"] = False
+        write_strict_state(hermes_home)
+
+        await adapter._handle_slack_message(make_event("ordinary free-response turn"))
 
         adapter.handle_message.assert_not_awaited()
 
@@ -514,8 +1104,46 @@ class TestResumeRequests:
         assert thread_key() not in read_state(hermes_home)
         adapter.handle_message.assert_awaited_once()
 
+    @pytest.mark.asyncio
+    async def test_resume_with_configured_mention_pattern_clears_strict_and_routes(
+        self, adapter, hermes_home
+    ):
+        adapter.config.extra["mention_patterns"] = [r"\bhermes\b"]
+        write_strict_state(hermes_home)
+
+        await adapter._handle_slack_message(make_event("hermes unmute"))
+
+        assert thread_key() not in read_state(hermes_home)
+        adapter.handle_message.assert_awaited_once()
+
 
 class TestOtherUserMentionGuard:
+    @pytest.mark.asyncio
+    async def test_primary_bot_id_collision_is_other_user_in_secondary_workspace(
+        self, adapter
+    ):
+        primary_bot_uid = "U_PRIMARY"
+        secondary_bot_uid = "U_SECONDARY"
+        adapter._bot_user_id = primary_bot_uid
+        adapter._team_bot_user_ids = {
+            TEAM_ID: primary_bot_uid,
+            OTHER_TEAM_ID: secondary_bot_uid,
+        }
+        adapter.config.extra.update({
+            "ignore_other_user_mentions": True,
+            "require_mention": False,
+        })
+        adapter._user_is_bot_cache[(OTHER_TEAM_ID, USER_ID)] = False
+        event = make_event(
+            f"<@{primary_bot_uid}> private request",
+            team=OTHER_TEAM_ID,
+        )
+        event["client_msg_id"] = "client-secondary"
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_other_user_mention_in_active_agent_thread_is_suppressed(
         self, adapter
@@ -524,6 +1152,19 @@ class TestOtherUserMentionGuard:
         assert thread_key() not in adapter._slack_active_thread_keys
 
         await adapter._handle_slack_message(make_event(f"<@{OTHER_USER_ID}> посмотри пожалуйста"))
+
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_pipe_form_other_user_mention_in_active_agent_thread_is_suppressed(
+        self, adapter
+    ):
+        set_active_session(adapter)
+        assert thread_key() not in adapter._slack_active_thread_keys
+
+        await adapter._handle_slack_message(
+            make_event(f"<@{OTHER_USER_ID}|alice> посмотри пожалуйста")
+        )
 
         adapter.handle_message.assert_not_awaited()
 
@@ -614,6 +1255,24 @@ class TestCommandGuard:
         assert msg_event.text.startswith("/stop")
 
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("command", ("/stop responding", "!stop responding"))
+    async def test_pipe_form_bot_mention_routes_as_command(
+        self, adapter, hermes_home, command
+    ):
+        set_active_session(adapter)
+
+        await adapter._handle_slack_message(
+            make_event(f"<@{BOT_USER_ID}|hermes> {command}")
+        )
+
+        assert read_state(hermes_home) == {}
+        adapter.handle_message.assert_awaited_once()
+        msg_event = adapter.handle_message.await_args.args[0]
+        assert msg_event.text == "/stop responding"
+        assert msg_event.message_type is MessageType.COMMAND
+
+
 class TestPersistenceAndIsolation:
     def test_team_scoped_session_lookup_accepts_matching_origin(self, adapter):
         install_session_store_entry(adapter, team=TEAM_ID)
@@ -678,16 +1337,40 @@ class TestPersistenceAndIsolation:
         recreated.handle_message.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_corrupt_thread_routing_json_is_ignored_safely(
+    async def test_corrupt_thread_routing_json_fails_closed_before_hydration(
         self, adapter, hermes_home
     ):
         path = state_file(hermes_home)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("{not valid json", encoding="utf-8")
+        adapter._fetch_thread_context = AsyncMock(return_value="thread context")
 
         await adapter._handle_slack_message(make_event(f"<@{BOT_USER_ID}> проверь"))
 
-        adapter.handle_message.assert_awaited_once()
+        adapter._fetch_thread_context.assert_not_awaited()
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_assistant_thread_lifecycle_does_not_bypass_strict_state(
+        self, adapter, hermes_home
+    ):
+        await adapter._handle_assistant_thread_lifecycle_event({
+            "type": "assistant_thread_started",
+            "team_id": TEAM_ID,
+            "assistant_thread": {
+                "channel_id": CHANNEL_ID,
+                "thread_ts": THREAD_TS,
+                "user_id": USER_ID,
+            },
+        })
+        assert (TEAM_ID, CHANNEL_ID, THREAD_TS) in adapter._assistant_threads
+        write_strict_state(hermes_home)
+
+        await adapter._handle_slack_message(
+            make_event("unaddressed Assistant thread follow-up")
+        )
+
+        adapter.handle_message.assert_not_awaited()
 
 
 class TestSuppressionSideEffects:
@@ -741,3 +1424,79 @@ class TestConfigAndPatterns:
         slack_extra = config.platforms[Platform.SLACK].extra
         assert slack_extra["thread_routing"]["enabled"] is True
         assert slack_extra["thread_routing"]["stop_patterns"] == ["quiet please"]
+
+
+class TestIsolatedPolicyIntegration:
+    @pytest.mark.asyncio
+    async def test_mention_pattern_evaluation_does_not_block_event_loop(
+        self, adapter, monkeypatch
+    ):
+        entered = threading.Event()
+        release = threading.Event()
+
+        def contended_match(text):
+            entered.set()
+            release.wait(timeout=1.0)
+            return False
+
+        monkeypatch.setattr(
+            adapter,
+            "_slack_message_matches_mention_patterns",
+            contended_match,
+        )
+        asyncio.get_running_loop().call_later(0.05, release.set)
+        started = time.monotonic()
+
+        await adapter._handle_slack_message(make_event("ordinary message"))
+
+        assert entered.is_set()
+        assert time.monotonic() - started < 0.5
+
+    @pytest.mark.asyncio
+    async def test_policy_evaluation_does_not_block_the_event_loop(self, adapter):
+        entered = threading.Event()
+        release = threading.Event()
+
+        def contended_evaluate(context):
+            entered.set()
+            release.wait(timeout=1.0)
+            return RoutingDecision(RoutingDisposition.DEFER)
+
+        adapter._thread_routing_policy = MagicMock(enabled=True)
+        adapter._thread_routing_policy.evaluate.side_effect = contended_evaluate
+        asyncio.get_running_loop().call_later(0.05, release.set)
+        started = time.monotonic()
+
+        await adapter._handle_slack_message(make_event(f"<@{BOT_USER_ID}> check"))
+
+        assert entered.is_set()
+        assert time.monotonic() - started < 0.5
+
+    @pytest.mark.asyncio
+    async def test_policy_suppression_runs_before_attachment_hydration(self, adapter):
+        adapter._thread_routing_policy = MagicMock()
+        adapter._thread_routing_policy.evaluate.return_value = RoutingDecision(
+            RoutingDisposition.SUPPRESS_STRICT,
+            strict=True,
+        )
+        adapter._fetch_thread_context = AsyncMock(return_value="thread context")
+        adapter._download_slack_file = AsyncMock(return_value="/tmp/downloaded.txt")
+
+        await adapter._handle_slack_message(
+            make_event(
+                f"<@{BOT_USER_ID}> still suppressed",
+                files=[
+                    {
+                        "id": "F1",
+                        "name": "image.png",
+                        "mimetype": "image/png",
+                        "url_private_download": "https://files.slack.test/F1",
+                    }
+                ],
+            )
+        )
+
+        adapter._thread_routing_policy.evaluate.assert_called_once()
+        adapter._fetch_thread_context.assert_not_awaited()
+        adapter._download_slack_file.assert_not_awaited()
+        adapter.handle_message.assert_not_awaited()

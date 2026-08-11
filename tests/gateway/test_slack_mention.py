@@ -502,6 +502,7 @@ def test_allowed_channels_env_var_blocks_channel(monkeypatch):
 async def test_block_extraction_debug_log_does_not_include_message_preview(caplog):
     secret_block_text = "private incident token: customer-id-12345"
     adapter = _make_adapter(allowed_channels=[CHANNEL_ID])
+    adapter._team_clients = {"T1": AsyncMock()}
     adapter._dedup = MagicMock(is_duplicate=MagicMock(return_value=False))
     adapter._lookup_assistant_thread_metadata = MagicMock(return_value={})
     adapter._channel_team = {}
