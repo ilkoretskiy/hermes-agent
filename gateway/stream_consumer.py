@@ -115,6 +115,7 @@ def ensure_closed_code_fences(text: str) -> str:
     # pollute the standalone count.  Also remove any trailing unclosed
     # ``` that leaks through (defence in depth).
     import re
+
     without_fences = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
     without_fences = re.sub(r"```[^`]*$", "", without_fences)
 
@@ -127,6 +128,7 @@ def ensure_closed_code_fences(text: str) -> str:
 @dataclass
 class StreamConsumerConfig:
     """Runtime config for a single stream consumer instance."""
+
     edit_interval: float = _DEFAULT_STREAMING_EDIT_INTERVAL
     buffer_threshold: int = _DEFAULT_STREAMING_BUFFER_THRESHOLD
     cursor: str = _DEFAULT_STREAMING_CURSOR
@@ -176,12 +178,20 @@ class GatewayStreamConsumer:
     # Must stay in sync with cli.py _OPEN_TAGS/_CLOSE_TAGS and
     # run_agent.py _strip_think_blocks() tag variants.
     _OPEN_THINK_TAGS = (
-        "<REASONING_SCRATCHPAD>", "<think>", "<reasoning>",
-        "<THINKING>", "<thinking>", "<thought>",
+        "<REASONING_SCRATCHPAD>",
+        "<think>",
+        "<reasoning>",
+        "<THINKING>",
+        "<thinking>",
+        "<thought>",
     )
     _CLOSE_THINK_TAGS = (
-        "</REASONING_SCRATCHPAD>", "</think>", "</reasoning>",
-        "</THINKING>", "</thinking>", "</thought>",
+        "</REASONING_SCRATCHPAD>",
+        "</think>",
+        "</reasoning>",
+        "</THINKING>",
+        "</thinking>",
+        "</thought>",
     )
 
     # Class-wide monotonic counter for native-streaming draft ids.  Telegram
@@ -242,9 +252,11 @@ class GatewayStreamConsumer:
         # must never delete an earlier finalized preamble/commentary message.
         self._segment_preview_message_ids: "set[str]" = set()
         self._already_sent = False
-        self._edit_supported = True  # Disabled when progressive edits are no longer usable
+        self._edit_supported = (
+            True  # Disabled when progressive edits are no longer usable
+        )
         self._last_edit_time = 0.0
-        self._last_sent_text = ""   # Track last-sent text to skip redundant edits
+        self._last_sent_text = ""  # Track last-sent text to skip redundant edits
         # True when the most recent _send_or_edit split-and-delivered across
         # continuation messages (the adapter adopted a new message id).
         self._last_edit_overflowed = False
@@ -258,7 +270,7 @@ class GatewayStreamConsumer:
         # edit retries at five seconds; a final-delivery fallback must not hold
         # the stream task through a longer flood cooldown before retrying.
         self._max_fallback_flood_retry_seconds = 5.0
-        self._flood_strikes = 0         # Consecutive flood-control edit failures
+        self._flood_strikes = 0  # Consecutive flood-control edit failures
         self._current_edit_interval = self.cfg.edit_interval  # Adaptive backoff
         self._final_response_sent = False
         # Set when the final response content was sent to the user via
@@ -418,6 +430,27 @@ class GatewayStreamConsumer:
         self._accumulated += text
         self._stream_ledger += text
 
+    def _mark_skip_redundant_finalize(self) -> None:
+        """Mark the turn final as delivered by a prior mid-stream edit.
+
+        Used by the run loop when the final accumulated content was already
+        delivered by the last visible edit and the explicit finalize edit is
+        skipped. Records what was actually ACKED on the wire, not what was
+        accumulated: a throttled edit-transport stream can reach this state
+        with the last acked edit still holding an earlier preview snapshot
+        (cursor-suffixed). Recording ``_accumulated`` would let a frozen
+        preview reconcile as the delivered final and suppress the corrective
+        send, leaving the user a cut-off message. The multi-message split
+        path keeps its ledger substitution inside
+        ``_record_turn_final_payload``.
+        """
+        self._final_response_sent = True
+        self._final_content_delivered = True
+        acked = self._last_sent_text or self._accumulated
+        if self.cfg.cursor and acked.endswith(self.cfg.cursor):
+            acked = acked[: -len(self.cfg.cursor)]
+        self._record_turn_final_payload(acked)
+
     def _record_turn_final_payload(self, text: str) -> None:
         """Record what the user has actually seen as this turn's final answer.
 
@@ -487,7 +520,10 @@ class GatewayStreamConsumer:
             return True
         return any(
             sent.strip() == target
-            for sent in (*self._delivered_commentary_texts, *self._delivered_segment_texts)
+            for sent in (
+                *self._delivered_commentary_texts,
+                *self._delivered_segment_texts,
+            )
         )
 
     def on_segment_break(self) -> None:
@@ -641,7 +677,7 @@ class GatewayStreamConsumer:
                 if best_len:
                     # Found closing tag — discard block, process remainder
                     self._in_think_block = False
-                    buf = buf[best_idx + best_len:]
+                    buf = buf[best_idx + best_len :]
                 else:
                     # No closing tag yet — hold tail that could be a
                     # partial closing tag prefix, discard the rest.
@@ -673,12 +709,11 @@ class GatewayStreamConsumer:
                             last_nl = preceding.rfind("\n")
                             if last_nl == -1:
                                 is_boundary = (
-                                    (not self._accumulated
-                                     or self._accumulated.endswith("\n"))
-                                    and preceding.strip() == ""
-                                )
+                                    not self._accumulated
+                                    or self._accumulated.endswith("\n")
+                                ) and preceding.strip() == ""
                             else:
-                                is_boundary = preceding[last_nl + 1:].strip() == ""
+                                is_boundary = preceding[last_nl + 1 :].strip() == ""
 
                         if is_boundary and (best_idx == -1 or idx < best_idx):
                             best_idx = idx
@@ -690,7 +725,7 @@ class GatewayStreamConsumer:
                     # Emit text before the tag, enter think block
                     self._append_accumulated(buf[:best_idx])
                     self._in_think_block = True
-                    buf = buf[best_idx + best_len:]
+                    buf = buf[best_idx + best_len :]
                 else:
                     # No opening tag — check for a partial tag at the tail
                     held_back = 0
@@ -729,11 +764,11 @@ class GatewayStreamConsumer:
         i = 0
         while i < len(text):
             matched = False
-            if text_lower[i:i + 2] == "</":
+            if text_lower[i : i + 2] == "</":
                 for tag in cls._CLOSE_THINK_TAGS:
                     tag_lower = tag.lower()
                     tag_len = len(tag_lower)
-                    if text_lower[i:i + tag_len] == tag_lower:
+                    if text_lower[i : i + tag_len] == tag_lower:
                         j = i + tag_len
                         while j < len(text) and text[j] in " \t\n\r":
                             j += 1
@@ -789,7 +824,8 @@ class GatewayStreamConsumer:
             self._draft_id = type(self)._draft_id_counter
             logger.debug(
                 "Stream consumer using native-draft transport (chat=%s draft_id=%s)",
-                self.chat_id, self._draft_id,
+                self.chat_id,
+                self._draft_id,
             )
 
         try:
@@ -815,10 +851,18 @@ class GatewayStreamConsumer:
                         if item is _NEW_SEGMENT:
                             got_segment_break = True
                             break
-                        if isinstance(item, tuple) and len(item) == 2 and item[0] is _COMMENTARY:
+                        if (
+                            isinstance(item, tuple)
+                            and len(item) == 2
+                            and item[0] is _COMMENTARY
+                        ):
                             commentary_text = item[1]
                             break
-                        if isinstance(item, tuple) and len(item) == 2 and item[0] is _FLUSH:
+                        if (
+                            isinstance(item, tuple)
+                            and len(item) == 2
+                            and item[0] is _FLUSH
+                        ):
                             # Flush barrier: finalize the current segment like a
                             # tool boundary, then signal the waiting thread once
                             # delivery for this iteration has completed (below).
@@ -856,14 +900,11 @@ class GatewayStreamConsumer:
                 now = time.monotonic()
                 elapsed = now - self._last_edit_time
                 should_edit = (
-                    got_done
-                    or got_segment_break
-                    or commentary_text is not None
+                    got_done or got_segment_break or commentary_text is not None
                 )
                 if not self.cfg.buffer_only:
                     should_edit = should_edit or (
-                        (elapsed >= self._current_edit_interval
-                            and self._accumulated)
+                        (elapsed >= self._current_edit_interval and self._accumulated)
                         # buffer_threshold is intentionally codepoint-based:
                         # it's a debounce heuristic ("send updates roughly
                         # every N visible characters"), not a platform-limit
@@ -905,13 +946,17 @@ class GatewayStreamConsumer:
                         # updating in-place as later streamed deltas arrive
                         # instead of posting every split as an immutable message.
                         chunks = self._truncate_for_stream(
-                            self._accumulated, _safe_limit, _len_fn,
+                            self._accumulated,
+                            _safe_limit,
+                            _len_fn,
                         )
                         if len(chunks) <= 1:
                             # A malformed/legacy adapter result must not leave
                             # this overflow branch with an unsplittable payload.
                             chunks = self._split_text_chunks(
-                                self._accumulated, _safe_limit, _len_fn,
+                                self._accumulated,
+                                _safe_limit,
+                                _len_fn,
                             )
                         chunks_delivered = False
                         reply_to = self._initial_reply_to_id
@@ -963,12 +1008,15 @@ class GatewayStreamConsumer:
                             tail_delivered = True
                             if self._accumulated:
                                 tail_delivered = await self._send_or_edit(
-                                    self._accumulated, finalize=True,
+                                    self._accumulated,
+                                    finalize=True,
                                 )
                             # Only claim final delivery if the sealed chunks and
                             # final tail actually landed.  ``_already_sent`` may
                             # be True from prior progress/fallback state (#10748).
-                            self._final_response_sent = chunks_delivered and tail_delivered
+                            self._final_response_sent = (
+                                chunks_delivered and tail_delivered
+                            )
                             if self._final_response_sent:
                                 self._final_content_delivered = True
                                 # Multi-message split delivery — record the
@@ -1001,7 +1049,9 @@ class GatewayStreamConsumer:
                         and self._edit_supported
                     ):
                         _cp_budget = _custom_unit_to_cp(
-                            self._accumulated, _safe_limit, _len_fn,
+                            self._accumulated,
+                            _safe_limit,
+                            _len_fn,
                         )
                         split_at = self._accumulated.rfind("\n", 0, _cp_budget)
                         if split_at < _cp_budget // 2:
@@ -1018,7 +1068,9 @@ class GatewayStreamConsumer:
                         # path (opt-in fresh_final_after_seconds) must not mark
                         # the turn delivered on it (#29346 semantics).
                         ok = await self._send_or_edit(
-                            chunk, finalize=True, is_turn_final=False,
+                            chunk,
+                            finalize=True,
+                            is_turn_final=False,
                         )
                         if self._fallback_final_send or not ok:
                             # Edit failed (or backed off due to flood control)
@@ -1035,7 +1087,11 @@ class GatewayStreamConsumer:
                         self._turn_split_delivery = True
 
                     display_text = self._accumulated
-                    if not got_done and not got_segment_break and commentary_text is None:
+                    if (
+                        not got_done
+                        and not got_segment_break
+                        and commentary_text is None
+                    ):
                         display_text += self.cfg.cursor
 
                     # Segment break: finalize the current message so platforms
@@ -1054,7 +1110,11 @@ class GatewayStreamConsumer:
                     self._last_edit_time = time.monotonic()
 
                 if got_done:
-                    if self._accumulated or self._message_id is not None or self._already_sent:
+                    if (
+                        self._accumulated
+                        or self._message_id is not None
+                        or self._already_sent
+                    ):
                         await self._notify_before_finalize()
                     # Final edit without cursor. If progressive editing failed
                     # mid-stream, send a single continuation/fallback message
@@ -1072,12 +1132,9 @@ class GatewayStreamConsumer:
                             # so just record delivery and stop.
                             self._final_content_delivered = True
                             self._record_turn_final_payload(self._accumulated)
-                        elif (
-                            current_update_visible
-                            and (
-                                not self._adapter_requires_finalize
-                                or self._last_edit_overflowed
-                            )
+                        elif current_update_visible and (
+                            not self._adapter_requires_finalize
+                            or self._last_edit_overflowed
                         ):
                             # Mid-stream edit above already delivered the
                             # final accumulated content.  Skip the redundant
@@ -1089,15 +1146,19 @@ class GatewayStreamConsumer:
                             # the full text would overflow-split again into
                             # the adopted continuation, duplicating chunks
                             # on screen.
-                            self._final_response_sent = True
-                            self._final_content_delivered = True
-                            self._record_turn_final_payload(self._accumulated)
+                            #
+                            # Delivery is recorded via the shared helper so
+                            # the recorded payload is the last ACKED edit,
+                            # not the accumulated text (frozen-preview
+                            # incident class; see _mark_skip_redundant_finalize).
+                            self._mark_skip_redundant_finalize()
                         elif self._message_id:
                             # Either the mid-stream edit didn't run (no
                             # visible update this tick) OR the adapter needs
                             # explicit finalize=True to close the stream.
                             self._final_response_sent = await self._send_or_edit(
-                                self._accumulated, finalize=True,
+                                self._accumulated,
+                                finalize=True,
                             )
                             if self._final_response_sent:
                                 self._final_content_delivered = True
@@ -1112,7 +1173,9 @@ class GatewayStreamConsumer:
                                 # not duplicate the visible prefix.
                                 await self._send_fallback_final(self._accumulated)
                         elif not self._already_sent:
-                            self._final_response_sent = await self._send_or_edit(self._accumulated)
+                            self._final_response_sent = await self._send_or_edit(
+                                self._accumulated
+                            )
                             if self._final_response_sent:
                                 self._final_content_delivered = True
                                 self._record_turn_final_payload(self._accumulated)
@@ -1178,7 +1241,9 @@ class GatewayStreamConsumer:
                 try:
                     _best_effort_ok = bool(
                         await self._send_or_edit(
-                            self._accumulated, finalize=True, is_turn_final=False,
+                            self._accumulated,
+                            finalize=True,
+                            is_turn_final=False,
                         )
                     )
                 except Exception:
@@ -1206,11 +1271,7 @@ class GatewayStreamConsumer:
             try:
                 while True:
                     item = self._queue.get_nowait()
-                    if (
-                        isinstance(item, tuple)
-                        and len(item) == 2
-                        and item[0] is _FLUSH
-                    ):
+                    if isinstance(item, tuple) and len(item) == 2 and item[0] is _FLUSH:
                         self._signal_flush(item[1])
             except queue.Empty:
                 pass
@@ -1257,7 +1318,10 @@ class GatewayStreamConsumer:
                 chat_id=self.chat_id,
                 content=text,
                 reply_to=reply_to_id,
-                metadata=self._metadata_for_send(final=final, expect_edits=True),
+                metadata=self._metadata_for_send(
+                    final=final,
+                    expect_edits=not final,
+                ),
             )
             if result.success and result.message_id:
                 self._message_id = str(result.message_id)
@@ -1279,14 +1343,14 @@ class GatewayStreamConsumer:
         """Return the visible text already shown in the streamed message."""
         prefix = self._last_sent_text or ""
         if self.cfg.cursor and prefix.endswith(self.cfg.cursor):
-            prefix = prefix[:-len(self.cfg.cursor)]
+            prefix = prefix[: -len(self.cfg.cursor)]
         return self._clean_for_display(prefix)
 
     def _continuation_text(self, final_text: str) -> str:
         """Return only the part of final_text the user has not already seen."""
         prefix = self._fallback_prefix or self._visible_prefix()
         if prefix and final_text.startswith(prefix):
-            return final_text[len(prefix):].lstrip()
+            return final_text[len(prefix) :].lstrip()
         return final_text
 
     @staticmethod
@@ -1378,7 +1442,8 @@ class GatewayStreamConsumer:
                     self.adapter,
                     "RESEND_FINAL_ON_EMPTY_STREAM_FALLBACK",
                     False,
-                ) is True
+                )
+                is True
             ):
                 delivery = await self._send_empty_fallback_final(final_text)
                 if delivery == "delivered":
@@ -1419,7 +1484,7 @@ class GatewayStreamConsumer:
                     and self.cfg.cursor
                     and self._last_sent_text.endswith(self.cfg.cursor)
                 ):
-                    clean_text = self._last_sent_text[:-len(self.cfg.cursor)]
+                    clean_text = self._last_sent_text[: -len(self.cfg.cursor)]
                     try:
                         result = await self._edit_message(
                             message_id=self._message_id,
@@ -1532,7 +1597,8 @@ class GatewayStreamConsumer:
                 except Exception as e:
                     logger.debug(
                         "Fallback partial cleanup failed (%s): %s",
-                        stale_message_id, e,
+                        stale_message_id,
+                        e,
                     )
 
         self._message_id = last_message_id
@@ -1703,7 +1769,8 @@ class GatewayStreamConsumer:
                 logger.debug(
                     "Draft streaming requested but unsupported (chat=%s, type=%r) — "
                     "falling back to edit",
-                    self.chat_id, self.cfg.chat_type,
+                    self.chat_id,
+                    self.cfg.chat_type,
                 )
             return False
         return True
@@ -1731,7 +1798,8 @@ class GatewayStreamConsumer:
             )
         except Exception as e:
             logger.debug(
-                "send_draft raised, disabling draft transport for this run: %s", e,
+                "send_draft raised, disabling draft transport for this run: %s",
+                e,
             )
             self._draft_failures += 1
             self._use_draft_streaming = False
@@ -1766,7 +1834,7 @@ class GatewayStreamConsumer:
         visible = self._fallback_prefix or self._visible_prefix()
         tail = self._accumulated
         if visible and tail.startswith(visible):
-            tail = tail[len(visible):].lstrip()
+            tail = tail[len(visible) :].lstrip()
         tail = self._clean_for_display(tail)
         if not tail.strip():
             return
@@ -1896,11 +1964,11 @@ class GatewayStreamConsumer:
         plus any continuation ids from an oversized split
         (``continuation_message_ids`` or ``raw_response['message_ids']``)."""
         self._track_preview_id(getattr(result, "message_id", None))
-        for mid in (getattr(result, "continuation_message_ids", None) or ()):
+        for mid in getattr(result, "continuation_message_ids", None) or ():
             self._track_preview_id(mid)
         raw = getattr(result, "raw_response", None) or {}
         if isinstance(raw, dict):
-            for mid in (raw.get("message_ids") or ()):
+            for mid in raw.get("message_ids") or ():
                 self._track_preview_id(mid)
 
     def _adapter_prefers_fresh_final(self, text: str) -> bool:
@@ -1986,14 +2054,19 @@ class GatewayStreamConsumer:
         delete_fn = getattr(self.adapter, "delete_message", None)
         if delete_fn is not None:
             for stale_id in stale_ids:
-                if not stale_id or stale_id == "__no_edit__" or stale_id == new_message_id:
+                if (
+                    not stale_id
+                    or stale_id == "__no_edit__"
+                    or stale_id == new_message_id
+                ):
                     continue
                 try:
                     await delete_fn(self.chat_id, stale_id)
                 except Exception as e:
                     logger.debug(
                         "Fresh-final preview cleanup failed (%s): %s",
-                        stale_id, e,
+                        stale_id,
+                        e,
                     )
         self._preview_message_ids = set()
         if new_message_id:
@@ -2040,7 +2113,8 @@ class GatewayStreamConsumer:
                 except Exception as e:
                     logger.debug(
                         "Silence-marker preview cleanup failed (%s): %s",
-                        stale_id, e,
+                        stale_id,
+                        e,
                     )
         self._preview_message_ids = set()
         self._message_id = None
@@ -2058,7 +2132,11 @@ class GatewayStreamConsumer:
         )
 
     async def _send_or_edit(
-        self, text: str, *, finalize: bool = False, is_turn_final: bool = True,
+        self,
+        text: str,
+        *,
+        finalize: bool = False,
+        is_turn_final: bool = True,
     ) -> bool:
         """Send or edit the streaming message.
 
@@ -2099,10 +2177,12 @@ class GatewayStreamConsumer:
         # ▉ block character renders as a visible white box ("tofu").
         # Existing messages (edits) are unaffected — only first sends gated.
         _MIN_NEW_MSG_CHARS = 4
-        if (self._message_id is None
-                and self.cfg.cursor
-                and self.cfg.cursor in text
-                and len(_visible_stripped) < _MIN_NEW_MSG_CHARS):
+        if (
+            self._message_id is None
+            and self.cfg.cursor
+            and self.cfg.cursor in text
+            and len(_visible_stripped) < _MIN_NEW_MSG_CHARS
+        ):
             return True  # too short for a standalone message — accumulate more
 
         # Native draft streaming: route mid-stream frames through send_draft.
@@ -2116,11 +2196,7 @@ class GatewayStreamConsumer:
         #     a tool-boundary segment break where the prior text was finalized
         #     as a real sendMessage and the next text segment continues editing
         #     that one — staying on edit-based for that segment is correct).
-        if (
-            self._use_draft_streaming
-            and not finalize
-            and self._message_id is None
-        ):
+        if self._use_draft_streaming and not finalize and self._message_id is None:
             # No-op skip: identical to the last frame we sent.
             if text == self._last_sent_text:
                 return True
@@ -2180,11 +2256,10 @@ class GatewayStreamConsumer:
                     # __dict__ for test doubles that explicitly assign the
                     # attribute (e.g. adapter.prefers_fresh_final_streaming
                     # = MagicMock(return_value=False)).
-                    _has_prefers_hook = (
-                        hasattr(type(self.adapter),
-                                "prefers_fresh_final_streaming")
-                        or "prefers_fresh_final_streaming"
-                            in getattr(self.adapter, "__dict__", {})
+                    _has_prefers_hook = hasattr(
+                        type(self.adapter), "prefers_fresh_final_streaming"
+                    ) or "prefers_fresh_final_streaming" in getattr(
+                        self.adapter, "__dict__", {}
                     )
                     _prefers_fresh = self._adapter_prefers_fresh_final(text)
                     if (
@@ -2197,7 +2272,8 @@ class GatewayStreamConsumer:
                             )
                         )
                         and await self._try_fresh_final(
-                            text, is_turn_final=is_turn_final,
+                            text,
+                            is_turn_final=is_turn_final,
                         )
                     ):
                         return True
@@ -2223,7 +2299,9 @@ class GatewayStreamConsumer:
                         # below the new continuation, not the original.
                         # ``getattr`` with default keeps backwards compat with
                         # SimpleNamespace mocks in tests that pre-date the field.
-                        _continuation_ids = getattr(result, "continuation_message_ids", ()) or ()
+                        _continuation_ids = (
+                            getattr(result, "continuation_message_ids", ()) or ()
+                        )
                         if (
                             _continuation_ids
                             and result.message_id
@@ -2269,7 +2347,9 @@ class GatewayStreamConsumer:
                             # duplicate #45517 fixed (#36965 / #25349).
                             self._record_turn_final_payload(text)
                         raw_response = getattr(result, "raw_response", None)
-                        if isinstance(raw_response, dict) and raw_response.get("partial_overflow"):
+                        if isinstance(raw_response, dict) and raw_response.get(
+                            "partial_overflow"
+                        ):
                             # Telegram edited/sent one or more overflow chunks,
                             # but not the complete response.  Preserve the
                             # visible prefix so the got_done fallback sends the
@@ -2284,8 +2364,8 @@ class GatewayStreamConsumer:
                             if isinstance(delivered_prefix, str) and delivered_prefix:
                                 self._last_sent_text = delivered_prefix
                                 self._fallback_prefix = delivered_prefix
-                                self._fallback_preserve_partial_messages = text.startswith(
-                                    delivered_prefix
+                                self._fallback_preserve_partial_messages = (
+                                    text.startswith(delivered_prefix)
                                 )
                             else:
                                 self._fallback_prefix = self._visible_prefix()
@@ -2304,7 +2384,8 @@ class GatewayStreamConsumer:
                         if self._is_flood_error(result):
                             self._flood_strikes += 1
                             self._current_edit_interval = min(
-                                self._current_edit_interval * 2, 10.0,
+                                self._current_edit_interval * 2,
+                                10.0,
                             )
                             logger.debug(
                                 "Flood control on edit (strike %d/%d), "
@@ -2320,7 +2401,8 @@ class GatewayStreamConsumer:
                                     self.adapter,
                                     "FALLBACK_ON_FINAL_EDIT_FLOOD",
                                     False,
-                                ) is True
+                                )
+                                is True
                             )
                             if (
                                 self._flood_strikes < self._MAX_FLOOD_STRIKES
@@ -2370,7 +2452,7 @@ class GatewayStreamConsumer:
                     reply_to=self._initial_reply_to_id,
                     metadata=self._metadata_for_send(
                         final=finalize,
-                        expect_edits=True,
+                        expect_edits=not finalize,
                     ),
                 )
                 if result.success:

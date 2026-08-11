@@ -30,11 +30,7 @@ def _make_adapter(extra=None):
 
 
 RICH_MD = "# Title\n\n- a\n  - nested\n\n---\n\nbody text"
-RICH_TABLE_MD = (
-    "| Item | Status | Note |\n"
-    "|---|---:|---|\n"
-    "| Hermes | ok | table |"
-)
+RICH_TABLE_MD = "| Item | Status | Note |\n|---|---:|---|\n| Hermes | ok | table |"
 
 
 class SlackRejectedBlocks(Exception):
@@ -66,7 +62,6 @@ class TestSendMessageBlocks:
         assert "blocks" not in kwargs
         assert kwargs["text"]  # plain text still sent
 
-
     @pytest.mark.asyncio
     async def test_enabled_but_unrenderable_falls_back_to_text(self):
         # 60 dividers -> renderer returns None -> no blocks kwarg, text stands
@@ -75,7 +70,6 @@ class TestSendMessageBlocks:
         kwargs = client.chat_postMessage.await_args.kwargs
         assert "blocks" not in kwargs
         assert kwargs["text"]
-
 
     @pytest.mark.asyncio
     async def test_feedback_buttons_opt_in_appended_to_blocks(self):
@@ -107,9 +101,10 @@ class TestEditMessageBlocks:
         assert "blocks" in kwargs and kwargs["blocks"]
         assert kwargs["text"]
 
-
     @pytest.mark.asyncio
-    async def test_block_rejection_retries_edit_without_blocks_using_workspace_client(self):
+    async def test_block_rejection_retries_edit_without_blocks_using_workspace_client(
+        self,
+    ):
         adapter, client = _make_adapter({"rich_blocks": True})
         client.chat_update = AsyncMock(
             side_effect=[SlackRejectedBlocks("invalid_blocks"), {"ts": "111.222"}]

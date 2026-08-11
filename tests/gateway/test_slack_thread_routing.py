@@ -124,7 +124,10 @@ def adapter(hermes_home):
         TEAM_ID: slack_adapter._app.client,
         OTHER_TEAM_ID: slack_adapter._app.client,
     }
-    slack_adapter._team_bot_user_ids = {TEAM_ID: BOT_USER_ID, OTHER_TEAM_ID: BOT_USER_ID}
+    slack_adapter._team_bot_user_ids = {
+        TEAM_ID: BOT_USER_ID,
+        OTHER_TEAM_ID: BOT_USER_ID,
+    }
     slack_adapter._team_bot_ids = {TEAM_ID: BOT_ID, OTHER_TEAM_ID: "B_SECONDARY"}
     slack_adapter._running = True
     slack_adapter.handle_message = AsyncMock()
@@ -205,7 +208,9 @@ def make_event(
     return event
 
 
-def set_active_session(adapter, *, team=TEAM_ID, channel=CHANNEL_ID, thread_ts=THREAD_TS):
+def set_active_session(
+    adapter, *, team=TEAM_ID, channel=CHANNEL_ID, thread_ts=THREAD_TS
+):
     """Mark exactly one team/channel/thread as an active agent thread.
 
     This helper models a persisted session-backed active thread only. It must
@@ -298,7 +303,9 @@ class TestNormalModeBaseline:
     ):
         set_active_session(adapter)
 
-        await adapter._handle_slack_message(make_event("обычный ответ в активном треде"))
+        await adapter._handle_slack_message(
+            make_event("обычный ответ в активном треде")
+        )
 
         adapter.handle_message.assert_awaited_once()
 
@@ -354,9 +361,7 @@ class TestWorkspaceScopedBotGate:
                     "elements": [
                         {
                             "type": "rich_text_section",
-                            "elements": [
-                                {"type": "user", "user_id": secondary_bot_id}
-                            ],
+                            "elements": [{"type": "user", "user_id": secondary_bot_id}],
                         }
                     ],
                 }
@@ -431,9 +436,10 @@ class TestWorkspaceScopedBotGate:
     async def test_userless_bot_event_is_suppressed_when_own_bot_id_is_unresolved(
         self, adapter, allow_bots
     ):
-        adapter.config.extra.update(
-            {"allow_bots": allow_bots, "require_mention": False}
-        )
+        adapter.config.extra.update({
+            "allow_bots": allow_bots,
+            "require_mention": False,
+        })
         adapter._team_bot_ids.pop(OTHER_TEAM_ID)
         event = make_event(
             f"<@{BOT_USER_ID}> unresolved identity",
@@ -913,7 +919,9 @@ class TestConversationFlow:
         adapter.handle_message.assert_not_awaited()
 
         await adapter._handle_slack_message(
-            make_event(f"<@{BOT_USER_ID}> можешь снова отвечать", ts="1710000005.000006")
+            make_event(
+                f"<@{BOT_USER_ID}> можешь снова отвечать", ts="1710000005.000006"
+            )
         )
         assert thread_key() not in read_state(hermes_home)
         adapter.handle_message.assert_awaited_once()
@@ -989,10 +997,14 @@ class TestStopRequests:
     async def test_unmentioned_stop_requires_team_scoped_active_thread(
         self, adapter, hermes_home
     ):
-        set_active_session(adapter, team=TEAM_ID, channel=CHANNEL_ID, thread_ts=THREAD_TS)
+        set_active_session(
+            adapter, team=TEAM_ID, channel=CHANNEL_ID, thread_ts=THREAD_TS
+        )
 
         await adapter._handle_slack_message(
-            make_event("не отвечай на сообщения", team=OTHER_TEAM_ID, channel=CHANNEL_ID)
+            make_event(
+                "не отвечай на сообщения", team=OTHER_TEAM_ID, channel=CHANNEL_ID
+            )
         )
 
         assert read_state(hermes_home) == {}
@@ -1028,7 +1040,9 @@ class TestStrictMode:
     ):
         write_strict_state(hermes_home)
 
-        await adapter._handle_slack_message(make_event(f"<@{BOT_USER_ID}> ответь на это"))
+        await adapter._handle_slack_message(
+            make_event(f"<@{BOT_USER_ID}> ответь на это")
+        )
 
         adapter.handle_message.assert_awaited_once()
         assert read_state(hermes_home)[thread_key()]["mode"] == "strict_mention"
@@ -1052,7 +1066,9 @@ class TestStrictMode:
         write_strict_state(hermes_home)
         set_active_session(adapter)
 
-        await adapter._handle_slack_message(make_event(f"<@{OTHER_USER_ID}> можешь проверить?"))
+        await adapter._handle_slack_message(
+            make_event(f"<@{OTHER_USER_ID}> можешь проверить?")
+        )
 
         adapter.handle_message.assert_not_awaited()
 
@@ -1070,7 +1086,9 @@ class TestStrictMode:
         assert read_state(hermes_home)[thread_key()]["mode"] == "strict_mention"
 
     @pytest.mark.asyncio
-    async def test_strict_state_overrides_free_response_channel(self, adapter, hermes_home):
+    async def test_strict_state_overrides_free_response_channel(
+        self, adapter, hermes_home
+    ):
         adapter.config.extra["require_mention"] = False
         write_strict_state(hermes_home)
 
@@ -1151,7 +1169,9 @@ class TestOtherUserMentionGuard:
         set_active_session(adapter)
         assert thread_key() not in adapter._slack_active_thread_keys
 
-        await adapter._handle_slack_message(make_event(f"<@{OTHER_USER_ID}> посмотри пожалуйста"))
+        await adapter._handle_slack_message(
+            make_event(f"<@{OTHER_USER_ID}> посмотри пожалуйста")
+        )
 
         adapter.handle_message.assert_not_awaited()
 
@@ -1169,10 +1189,10 @@ class TestOtherUserMentionGuard:
         adapter.handle_message.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_other_user_mention_requires_team_scoped_active_thread(
-        self, adapter
-    ):
-        set_active_session(adapter, team=TEAM_ID, channel=CHANNEL_ID, thread_ts=THREAD_TS)
+    async def test_other_user_mention_requires_team_scoped_active_thread(self, adapter):
+        set_active_session(
+            adapter, team=TEAM_ID, channel=CHANNEL_ID, thread_ts=THREAD_TS
+        )
 
         await adapter._handle_slack_message(
             make_event(f"<@{OTHER_USER_ID}> посмотри пожалуйста", team=OTHER_TEAM_ID)
@@ -1186,7 +1206,9 @@ class TestOtherUserMentionGuard:
     ):
         install_session_store_entry(adapter, team=None)
 
-        await adapter._handle_slack_message(make_event(f"<@{OTHER_USER_ID}> посмотри пожалуйста"))
+        await adapter._handle_slack_message(
+            make_event(f"<@{OTHER_USER_ID}> посмотри пожалуйста")
+        )
 
         adapter.handle_message.assert_not_awaited()
 
@@ -1197,7 +1219,9 @@ class TestOtherUserMentionGuard:
         adapter.config.extra["thread_routing"].pop("suppress_other_user_mentions")
         set_active_session(adapter)
 
-        await adapter._handle_slack_message(make_event(f"<@{OTHER_USER_ID}> посмотри пожалуйста"))
+        await adapter._handle_slack_message(
+            make_event(f"<@{OTHER_USER_ID}> посмотри пожалуйста")
+        )
 
         adapter.handle_message.assert_not_awaited()
 
@@ -1254,7 +1278,6 @@ class TestCommandGuard:
         msg_event = adapter.handle_message.await_args.args[0]
         assert msg_event.text.startswith("/stop")
 
-
     @pytest.mark.asyncio
     @pytest.mark.parametrize("command", ("/stop responding", "!stop responding"))
     async def test_pipe_form_bot_mention_routes_as_command(
@@ -1304,8 +1327,12 @@ class TestPersistenceAndIsolation:
     async def test_strict_state_is_isolated_by_team_channel_and_thread(
         self, adapter, hermes_home
     ):
-        write_strict_state(hermes_home, team=TEAM_ID, channel=CHANNEL_ID, thread_ts=THREAD_TS)
-        set_active_session(adapter, team=TEAM_ID, channel=OTHER_CHANNEL_ID, thread_ts=THREAD_TS)
+        write_strict_state(
+            hermes_home, team=TEAM_ID, channel=CHANNEL_ID, thread_ts=THREAD_TS
+        )
+        set_active_session(
+            adapter, team=TEAM_ID, channel=OTHER_CHANNEL_ID, thread_ts=THREAD_TS
+        )
 
         await adapter._handle_slack_message(
             make_event("same timestamp, different channel", channel=OTHER_CHANNEL_ID)
@@ -1332,7 +1359,9 @@ class TestPersistenceAndIsolation:
         recreated.handle_message = AsyncMock()
         set_active_session(recreated)
 
-        await recreated._handle_slack_message(make_event("обычное сообщение после рестарта"))
+        await recreated._handle_slack_message(
+            make_event("обычное сообщение после рестарта")
+        )
 
         recreated.handle_message.assert_not_awaited()
 
@@ -1394,7 +1423,9 @@ class TestSuppressionSideEffects:
             }
         ]
 
-        await adapter._handle_slack_message(make_event("обычное сообщение", files=files))
+        await adapter._handle_slack_message(
+            make_event("обычное сообщение", files=files)
+        )
 
         adapter._fetch_thread_context.assert_not_awaited()
         adapter._download_slack_file.assert_not_awaited()
@@ -1403,7 +1434,9 @@ class TestSuppressionSideEffects:
 
 
 class TestConfigAndPatterns:
-    def test_slack_thread_routing_config_is_bridged_into_platform_extra(self, tmp_path, monkeypatch):
+    def test_slack_thread_routing_config_is_bridged_into_platform_extra(
+        self, tmp_path, monkeypatch
+    ):
         from gateway.config import Platform, load_gateway_config
 
         hermes_home = tmp_path / ".hermes"
