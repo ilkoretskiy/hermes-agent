@@ -476,7 +476,7 @@ async def _download_image(image_url: str, destination: Path, max_retries: int = 
                 blocked = check_website_access(final_url)
                 if blocked:
                     raise PermissionError(blocked["message"])
-                
+
                 # Save the image content (double-check actual size)
                 body = response.content
                 if len(body) > _VISION_MAX_DOWNLOAD_BYTES:
