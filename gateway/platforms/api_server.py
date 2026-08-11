@@ -1099,18 +1099,6 @@ def _openai_error(message: str, err_type: str = "invalid_request_error", param: 
     }
 
 
-class ModelAliasNotFound(ValueError):
-    """Raised when legacy ``extra.models`` lacks a requested alias."""
-
-
-class ModelAliasMisconfigured(RuntimeError):
-    """Raised when a legacy model alias cannot resolve its runtime secret."""
-
-
-class ModelAliasInvalid(ValueError):
-    """Raised when a legacy model alias is not a string."""
-
-
 _api_agent_request_reservation: ContextVar[Optional[dict[str, bool]]] = ContextVar(
     "api_agent_request_reservation", default=None
 )
@@ -1398,13 +1386,6 @@ class APIServerAdapter(BasePlatformAdapter):
         self._model_name: str = self._resolve_model_name(
             extra.get("model_name", os.getenv("API_SERVER_MODEL_NAME", "")),
         )
-        # Planner5D compatibility: the maintained fork predates upstream's
-        # ``model_routes`` and exposed the same concept as ``extra.models``.
-        # Normalize that legacy shape into the upstream route engine rather
-        # than keeping a second agent-construction path.
-        self._legacy_models_map: Dict[str, Dict[str, Any]] = self._parse_legacy_models(
-            extra,
-        )
         # model_routes: maps incoming ``model`` field values to specific
         # provider/model configs so one API server instance can serve
         # multiple clients on different backends.
@@ -1418,13 +1399,9 @@ class APIServerAdapter(BasePlatformAdapter):
         #       api_key: "sk-…"          # optional — per-route UPSTREAM provider
         #                                # key override (NOT caller auth; never logged)
         #       base_url: "https://…"    # optional — per-route base URL override
-        configured_model_routes = self._parse_model_routes(extra.get("model_routes"))
-        self._explicit_model_route_aliases = set(configured_model_routes)
-        self._model_routes: Dict[str, Dict[str, Any]] = {
-            **self._legacy_models_map,
-            **configured_model_routes,
-        }
-        self._has_explicit_model_routes = bool(configured_model_routes)
+        self._model_routes: Dict[str, Dict[str, Any]] = self._parse_model_routes(
+            extra.get("model_routes"),
+        )
         # direct_model_requests: opt-in passthrough for a bare ``model`` value
         # (no ``provider``) on the OpenAI-compatible surfaces
         # (/v1/chat/completions, /v1/responses).  Off by default: generic
@@ -2286,14 +2263,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
             return {}
 
-        allowed_keys = (
-            "model",
-            "provider",
-            "api_key",
-            "api_key_env",
-            "base_url",
-            "api_mode",
-        )
+        allowed_keys = ("model", "provider", "api_key", "base_url")
         routes: Dict[str, Dict[str, Any]] = {}
         for alias, cfg in raw.items():
             alias_str = str(alias).strip()
@@ -2315,116 +2285,11 @@ class APIServerAdapter(BasePlatformAdapter):
             routes[alias_str] = route
         return routes
 
-    @classmethod
-    def _parse_legacy_models(cls, extra: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-        """Validate the maintained fork's legacy ``extra.models`` contract."""
-        if "models" not in extra or extra.get("models") is None:
-            return {}
-        raw = extra.get("models")
-        if not isinstance(raw, dict):
-            raise ValueError(
-                f"platforms.api_server.models must be a mapping, got {type(raw).__name__}"
-            )
-        routes = cls._parse_model_routes(raw)
-        if not routes:
-            raise ValueError(
-                "platforms.api_server.models must contain at least one valid model"
-            )
-        return routes
-
     def _resolve_route(self, model_alias: Any) -> Optional[Dict[str, Any]]:
         """Return the model_routes entry for *model_alias*, or None."""
         if not self._model_routes or not isinstance(model_alias, str):
             return None
-        configured = self._model_routes.get(model_alias)
-        if configured is None:
-            return None
-        route = dict(configured)
-        env_var = route.pop("api_key_env", None)
-        if env_var and not route.get("api_key"):
-            # Route credentials are profile secrets under multiplexing. A raw
-            # process-env read here could borrow another profile's key even
-            # though the request itself is correctly profile-scoped.
-            value = _get_scoped_secret(str(env_var), "")
-            if not value:
-                raise ModelAliasMisconfigured(
-                    f"api_key_env={env_var!r} is unset for the requested model alias"
-                )
-            route["api_key"] = value
-        return route
-
-    def _resolve_client_model_route(self, requested: Any) -> Optional[Dict[str, Any]]:
-        """Resolve a request model while preserving legacy alias validation."""
-        if not self._legacy_models_map:
-            return self._resolve_route(requested)
-
-        strict_legacy_aliases = not self._has_explicit_model_routes
-        if strict_legacy_aliases and not isinstance(requested, str):
-            raise ModelAliasInvalid("'model' must be a string")
-        route = self._resolve_route(requested)
-        if route is None:
-            if strict_legacy_aliases:
-                raise ModelAliasNotFound(f"Unknown model: {requested}")
-            return None
-        if self._is_legacy_only_alias(requested):
-            # Legacy aliases are complete per-client runtime contracts. An
-            # omitted transport field must clear the primary runtime value,
-            # not leak it from another provider into this route.
-            route.setdefault("base_url", None)
-            route.setdefault("api_mode", None)
-        return route
-
-    def _is_legacy_only_alias(self, requested: Any) -> bool:
-        return (
-            isinstance(requested, str)
-            and requested in self._legacy_models_map
-            and requested not in self._explicit_model_route_aliases
-        )
-
-    @staticmethod
-    def _model_alias_error_response(exc: Exception) -> Any:
-        assert web is not None
-        if isinstance(exc, ModelAliasNotFound):
-            return web.json_response(
-                _openai_error(str(exc), param="model", code="model_not_found"),
-                status=400,
-            )
-        if isinstance(exc, ModelAliasInvalid):
-            return web.json_response(
-                _openai_error(str(exc), param="model", code="invalid_model"),
-                status=400,
-            )
-        return web.json_response(
-            _openai_error(
-                str(exc),
-                err_type="server_error",
-                param="model",
-                code="model_misconfigured",
-            ),
-            status=503,
-        )
-
-    def _append_legacy_route_metadata(
-        self,
-        prompt: Optional[str],
-        requested: Any,
-        route: Optional[Dict[str, Any]],
-    ) -> Optional[str]:
-        """Keep the fork's per-turn alias identity note for legacy routes."""
-        if (
-            not isinstance(requested, str)
-            or not self._is_legacy_only_alias(requested)
-            or not isinstance(route, dict)
-            or not route.get("model")
-        ):
-            return prompt
-        note = (
-            "Runtime model routing metadata: current requested alias is "
-            f"`{requested}`; backing model is `{route['model']}`. If asked about "
-            "the current model, answer from this metadata rather than earlier "
-            "conversation text or config defaults."
-        )
-        return f"{prompt}\n\n{note}" if prompt else note
+        return self._model_routes.get(model_alias)
 
     @staticmethod
     def _clean_runtime_id(value: Any, *, max_len: int = 200) -> str:
@@ -2816,9 +2681,6 @@ class APIServerAdapter(BasePlatformAdapter):
         route_provider = _clean_request_string(route.get("provider")) if isinstance(route, dict) else None
         route_api_key = _clean_request_string(route.get("api_key")) if isinstance(route, dict) else None
         route_base_url = _clean_request_string(route.get("base_url")) if isinstance(route, dict) else None
-        route_has_base_url = isinstance(route, dict) and "base_url" in route
-        route_api_mode = route.get("api_mode") if isinstance(route, dict) else None
-        route_has_api_mode = isinstance(route, dict) and "api_mode" in route
 
         def _resolve_provider_runtime(
             provider: Optional[str],
@@ -2942,16 +2804,8 @@ class APIServerAdapter(BasePlatformAdapter):
             # route contract after provider resolution.
             if route_api_key:
                 runtime_kwargs["api_key"] = route_api_key
-                # Direct API credentials select an HTTP route; inherited
-                # native-CLI and pooled credentials belong to the primary
-                # runtime and must not cross this route boundary.
-                runtime_kwargs["command"] = None
-                runtime_kwargs["args"] = []
-                runtime_kwargs["credential_pool"] = None
-            if route_has_base_url:
+            if route_base_url:
                 runtime_kwargs["base_url"] = route_base_url
-            if route_has_api_mode:
-                runtime_kwargs["api_mode"] = route_api_mode
             if route:
                 logger.debug(
                     "api_server request selection applied: model=%s provider=%s route_provider=%s request_provider=%s",
@@ -3161,37 +3015,20 @@ class APIServerAdapter(BasePlatformAdapter):
                 "parent": None,
             }
         ]
-        # Preserve the old Planner5D discovery shape when only ``extra.models``
-        # is configured: clients see aliases only, not the adapter's virtual
-        # model. Explicit upstream ``model_routes`` keeps the upstream shape.
-        if self._legacy_models_map and not self._has_explicit_model_routes:
-            models = []
         # Expose configured model route aliases so clients can discover them.
         # Only the alias and resolved model name are exposed — never provider
         # credentials.
-        route_items = self._model_routes.items()
-        if self._legacy_models_map and not self._has_explicit_model_routes:
-            route_items = sorted(route_items)
-        for alias, route_cfg in route_items:
-            if alias == model_name and models:
+        for alias, route_cfg in self._model_routes.items():
+            if alias == model_name:
                 continue  # already listed above
-            legacy_alias = self._is_legacy_only_alias(alias)
             models.append({
                 "id": alias,
                 "object": "model",
                 "created": now,
                 "owned_by": "hermes",
                 "permission": [],
-                "root": (
-                    alias
-                    if legacy_alias and not self._has_explicit_model_routes
-                    else route_cfg.get("model", alias)
-                ),
-                "parent": (
-                    None
-                    if legacy_alias and not self._has_explicit_model_routes
-                    else model_name
-                ),
+                "root": route_cfg.get("model", alias),
+                "parent": model_name,
             })
 
         return web.json_response({"object": "list", "data": models})
@@ -3248,7 +3085,6 @@ class APIServerAdapter(BasePlatformAdapter):
             "object": "hermes.api_server.capabilities",
             "platform": "hermes-agent",
             "model": self._model_name,
-            "models": sorted(self._model_routes),
             "auth": {
                 "type": "bearer",
                 "required": bool(self._api_key),
@@ -4262,15 +4098,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # Per-client model routing: if the requested model matches a
         # configured model_routes alias, this request's agent is created
         # with that route's model/provider instead of the global default.
-        try:
-            route = self._resolve_client_model_route(model_name)
-        except (ModelAliasNotFound, ModelAliasInvalid, ModelAliasMisconfigured) as exc:
-            return self._model_alias_error_response(exc)
-        effective_system_prompt = self._append_legacy_route_metadata(
-            system_prompt,
-            model_name,
-            route,
-        )
+        route = self._resolve_route(model_name)
         agent_overrides = _request_agent_overrides(
             body,
             virtual_model=self._model_name,
@@ -4362,7 +4190,7 @@ class APIServerAdapter(BasePlatformAdapter):
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
                 conversation_history=history,
-                ephemeral_system_prompt=effective_system_prompt,
+                ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
                 tool_start_callback=_on_tool_start,
@@ -4387,7 +4215,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return await self._run_agent(
                 user_message=user_message,
                 conversation_history=history,
-                ephemeral_system_prompt=effective_system_prompt,
+                ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,
@@ -5412,16 +5240,7 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id = stored_session_id or str(uuid.uuid4())
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
-        requested_model = body.get("model")
-        try:
-            route = self._resolve_client_model_route(requested_model)
-        except (ModelAliasNotFound, ModelAliasInvalid, ModelAliasMisconfigured) as exc:
-            return self._model_alias_error_response(exc)
-        effective_instructions = self._append_legacy_route_metadata(
-            instructions,
-            requested_model,
-            route,
-        )
+        route = self._resolve_route(body.get("model"))
         agent_overrides = _request_agent_overrides(
             body,
             virtual_model=self._model_name,
@@ -5481,7 +5300,7 @@ class APIServerAdapter(BasePlatformAdapter):
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
                 conversation_history=conversation_history,
-                ephemeral_system_prompt=effective_instructions,
+                ephemeral_system_prompt=instructions,
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
                 tool_progress_callback=_on_tool_progress,
@@ -5521,7 +5340,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return await self._run_agent(
                 user_message=user_message,
                 conversation_history=conversation_history,
-                ephemeral_system_prompt=effective_instructions,
+                ephemeral_system_prompt=instructions,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,
@@ -6646,11 +6465,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
         session_id = body.get("session_id") or stored_session_id
-        requested_model = body.get("model")
-        try:
-            route = self._resolve_client_model_route(requested_model)
-        except (ModelAliasNotFound, ModelAliasInvalid, ModelAliasMisconfigured) as exc:
-            return self._model_alias_error_response(exc)
+        route = self._resolve_route(body.get("model"))
         agent_overrides = _request_agent_overrides(body, virtual_model=self._model_name)
         selection_error = self._request_route_conflict_error(
             session_id=session_id,
@@ -6670,11 +6485,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # concurrent runs can intentionally share them, and resolving an
         # approval for one run must not unblock another run's dangerous command.
         approval_session_key = run_id
-        ephemeral_system_prompt = self._append_legacy_route_metadata(
-            instructions,
-            requested_model,
-            route,
-        )
+        ephemeral_system_prompt = instructions
         loop = asyncio.get_running_loop()
         q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
         created_at = time.time()
