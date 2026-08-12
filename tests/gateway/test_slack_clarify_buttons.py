@@ -133,6 +133,34 @@ class TestSlackSendClarify:
                 action_ids = [element["action_id"] for element in block["elements"]]
                 assert len(action_ids) == len(set(action_ids))
 
+    @pytest.mark.asyncio
+    async def test_multi_choice_uses_explicit_workspace_client_when_channel_is_ambiguous(
+        self,
+    ):
+        adapter = _make_adapter()
+        primary_client = adapter._app.client
+        primary_client.chat_postMessage = AsyncMock()
+        secondary_client = AsyncMock()
+        secondary_client.chat_postMessage = AsyncMock(return_value={"ts": "2.2"})
+        adapter._team_clients = {
+            "T_PRIMARY": primary_client,
+            "T_SECONDARY": secondary_client,
+        }
+        adapter._channel_team = {}
+        adapter._channel_teams = {"C_SHARED": {"T_PRIMARY", "T_SECONDARY"}}
+
+        result = await adapter.send_clarify(
+            chat_id="C_SHARED",
+            question="Which environment?",
+            choices=["staging", "production"],
+            clarify_id="cid-scoped",
+            session_key="sk-scoped",
+            metadata={"team_id": "T_SECONDARY"},
+        )
+
+        assert result.success is True
+        secondary_client.chat_postMessage.assert_awaited_once()
+        primary_client.chat_postMessage.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_mrkdwn_escapes_question(self):

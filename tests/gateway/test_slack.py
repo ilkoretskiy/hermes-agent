@@ -397,6 +397,28 @@ class TestSlashCommandSessionIsolation:
         assert event.source.scope_id == "T123"
 
     @pytest.mark.asyncio
+    async def test_scoped_slash_context_preserves_workspace_for_reply(self, adapter):
+        secondary_client = AsyncMock()
+        adapter._team_clients = {"T_SECONDARY": secondary_client}
+        adapter._team_bot_user_ids = {"T_SECONDARY": "U_SECONDARY_BOT"}
+        adapter._team_bot_ids = {"T_SECONDARY": "B_SECONDARY"}
+        adapter._team_bot_names = {"T_SECONDARY": "secondary"}
+
+        await adapter._handle_slash_command({
+            "command": "/q",
+            "text": "private question",
+            "user_id": "U_SECONDARY_USER",
+            "channel_id": "C_SHARED",
+            "team_id": "T_SECONDARY",
+            "response_url": "https://hooks.slack.test/commands/secondary",
+        })
+
+        ctx = adapter._slash_command_contexts[
+            ("T_SECONDARY", "C_SHARED", "U_SECONDARY_USER")
+        ]
+        assert ctx["team_id"] == "T_SECONDARY"
+
+    @pytest.mark.asyncio
     async def test_explicit_workspace_without_client_suppresses_slash_command(
         self, adapter
     ):
@@ -4201,6 +4223,39 @@ class TestSlashEphemeralAck:
         assert result.success is True
         adapter._app.client.chat_postEphemeral.assert_awaited_once()
         adapter._app.client.chat_postMessage.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_slash_ephemeral_fallback_uses_explicit_workspace_client(
+        self, adapter
+    ):
+        primary_client = adapter._app.client
+        primary_client.chat_postEphemeral = AsyncMock()
+        secondary_client = AsyncMock()
+        secondary_client.chat_postEphemeral = AsyncMock(return_value={"ok": True})
+        adapter._team_clients = {
+            "T_PRIMARY": primary_client,
+            "T_SECONDARY": secondary_client,
+        }
+        adapter._channel_team = {}
+        adapter._channel_teams = {"C_SHARED": {"T_PRIMARY", "T_SECONDARY"}}
+        ctx = {
+            "response_url": "https://hooks.slack.test/commands/secondary",
+            "user_id": "U_SECONDARY",
+            "team_id": "T_SECONDARY",
+            "ts": time.monotonic(),
+        }
+
+        result = await adapter._post_ephemeral_fallback(
+            "C_SHARED", ctx, "private response"
+        )
+
+        assert result.success is True
+        secondary_client.chat_postEphemeral.assert_awaited_once_with(
+            channel="C_SHARED",
+            user="U_SECONDARY",
+            text="private response",
+        )
+        primary_client.chat_postEphemeral.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_send_slash_ephemeral_both_paths_fail_never_posts_publicly(

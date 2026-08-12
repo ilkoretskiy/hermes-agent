@@ -76,17 +76,17 @@ controls in another workspace that happens to reuse the same channel/thread IDs.
 ## State file
 
 Strict-mode state is persisted in `state_file`, relative to `HERMES_HOME` unless
-an absolute path is configured. The write path uses a unique temporary filename
-before replace to avoid temp-file collisions:
+an absolute path is configured. Mutations hold a process-local lock and a POSIX
+advisory file lock, then write through a unique temporary file and atomically
+replace the state file. A sibling `.pending` transaction marker plus file and
+directory `fsync` calls make incomplete or ambiguous writes fail closed after a
+restart.
 
-```text
-.{state_file_name}.{pid}.{time.monotonic_ns()}.tmp
-```
-
-The state file is still read-modify-write without a cross-process lock. It is
-suitable for the current single-gateway-process deployment model. If multiple
-gateway processes share one state file, add a file lock or move this state to a
-shared transactional backend.
+The lock is host-local. Multiple gateway processes on the same POSIX host may
+share the file, but deployments spanning hosts should use a shared transactional
+backend rather than a shared filesystem whose lock and durability semantics have
+not been verified. Platforms without `fcntl` fail closed instead of mutating
+state without a lock.
 
 ## Tests
 
@@ -99,6 +99,6 @@ tests/gateway/test_slack_thread_routing.py
 Useful checks:
 
 ```bash
-.venv/bin/python -m pytest tests/gateway/test_slack_thread_routing.py -q -o 'addopts='
-.venv/bin/python -m pytest tests/gateway/test_slack.py tests/gateway/test_slack_mention.py tests/gateway/test_slack_thread_routing.py -q -o 'addopts='
+scripts/run_tests.sh tests/gateway/test_slack_thread_routing.py -q
+scripts/run_tests.sh tests/gateway/test_slack.py tests/gateway/test_slack_mention.py tests/gateway/test_slack_thread_routing.py -q
 ```

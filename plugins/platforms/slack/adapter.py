@@ -1744,7 +1744,7 @@ class SlackAdapter(BasePlatformAdapter):
         if not chunks:
             chunks = [formatted]
         try:
-            client = self._get_client(chat_id)
+            client = self._get_client(chat_id, team_id=ctx.get("team_id"))
             for chunk in chunks:
                 result = await client.chat_postEphemeral(
                     channel=chat_id,
@@ -6931,9 +6931,8 @@ class SlackAdapter(BasePlatformAdapter):
         if not self._app:
             return SendResult(success=False, error="Not connected")
 
-        chat_id = await self._ensure_dm_conversation(
-            chat_id, team_id=self._metadata_team_id(metadata)
-        )
+        team_id = self._metadata_team_id(metadata)
+        chat_id = await self._ensure_dm_conversation(chat_id, team_id=team_id)
         try:
             thread_ts = self._resolve_thread_ts(None, metadata)
 
@@ -6990,7 +6989,9 @@ class SlackAdapter(BasePlatformAdapter):
             if thread_ts:
                 kwargs["thread_ts"] = thread_ts
 
-            result = await self._get_client(chat_id).chat_postMessage(**kwargs)
+            result = await self._get_client(chat_id, team_id=team_id).chat_postMessage(
+                **kwargs
+            )
             msg_ts = result.get("ts", "")
             if msg_ts:
                 # Mark unresolved so the action handler's atomic-pop guard can
@@ -8178,8 +8179,10 @@ class SlackAdapter(BasePlatformAdapter):
             self._slash_command_contexts[context_key] = {
                 "response_url": response_url,
                 # Kept for the chat.postEphemeral fallback when response_url
-                # delivery fails — postEphemeral needs an explicit user.
+                # delivery fails — postEphemeral needs an explicit user and
+                # the exact workspace client.
                 "user_id": user_id,
+                "team_id": str(team_id or ""),
                 "ts": time.monotonic(),
             }
             if len(self._slash_command_contexts) > self._SLASH_CTX_MAX:
