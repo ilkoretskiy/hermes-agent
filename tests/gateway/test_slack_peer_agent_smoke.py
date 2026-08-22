@@ -29,7 +29,10 @@ def _ensure_slack_mock():
         ("slack_bolt.async_app", slack_bolt.async_app),
         ("slack_bolt.adapter", slack_bolt.adapter),
         ("slack_bolt.adapter.socket_mode", slack_bolt.adapter.socket_mode),
-        ("slack_bolt.adapter.socket_mode.async_handler", slack_bolt.adapter.socket_mode.async_handler),
+        (
+            "slack_bolt.adapter.socket_mode.async_handler",
+            slack_bolt.adapter.socket_mode.async_handler,
+        ),
         ("slack_sdk", slack_sdk),
         ("slack_sdk.web", slack_sdk.web),
         ("slack_sdk.web.async_client", slack_sdk.web.async_client),
@@ -86,13 +89,15 @@ def _assert_peer_agent_preflight(adapter: SlackAdapter) -> None:
     assert adapter._slack_strict_mention() is True, (
         "config: slack.strict_mention must be true so stale thread state cannot wake peers"
     )
-    assert str(adapter.config.extra.get("allow_bots", "")).lower().strip() == "mentions", (
-        "config: slack.allow_bots must be 'mentions' for peer-agent routing smoke"
-    )
+    assert (
+        str(adapter.config.extra.get("allow_bots", "")).lower().strip() == "mentions"
+    ), "config: slack.allow_bots must be 'mentions' for peer-agent routing smoke"
     assert adapter._slack_allowed_channels() == set(), (
         "config: slack.allowed_channels must stay empty for the documented smoke profile"
     )
-    assert adapter._app is not None and getattr(adapter._app, "client", None) is not None, (
+    assert (
+        adapter._app is not None and getattr(adapter._app, "client", None) is not None
+    ), (
         "platform_connectivity: Slack client must be initialized before routing smoke runs"
     )
     assert adapter._bot_user_id, (
@@ -116,6 +121,7 @@ def smoke_adapter():
     adapter._app = MagicMock()
     adapter._app.client = AsyncMock()
     adapter._bot_user_id = BOT_USER_ID
+    adapter._team_clients = {TEAM_ID: adapter._app.client}
     adapter._team_bot_user_ids = {TEAM_ID: BOT_USER_ID}
     adapter._channel_team = {}
     adapter._running = True
@@ -127,7 +133,6 @@ def smoke_adapter():
 
 
 class TestSlackPeerAgentSmoke:
-
     @pytest.mark.asyncio
     async def test_human_message_with_current_mention_routes(self, smoke_adapter):
         event = _make_event(
@@ -145,7 +150,6 @@ class TestSlackPeerAgentSmoke:
         )
         assert msg_event.source.thread_id == REPLY_TS
         smoke_adapter._fetch_thread_context.assert_not_awaited()
-
 
     @pytest.mark.asyncio
     async def test_peer_bot_with_current_explicit_mention_routes(self, smoke_adapter):
@@ -171,4 +175,3 @@ class TestSlackPeerAgentSmoke:
             "routing_logic: strict peer-agent mode must not persist thread mentions after routing"
         )
         smoke_adapter._fetch_thread_context.assert_awaited_once()
-

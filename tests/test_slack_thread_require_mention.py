@@ -1,5 +1,6 @@
 import asyncio
 import os
+from unittest.mock import AsyncMock
 
 from gateway.config import PlatformConfig
 from plugins.platforms.slack.adapter import SlackAdapter, _apply_yaml_config
@@ -14,6 +15,7 @@ def make_adapter(extra=None):
     adapter = SlackAdapter(config)
     adapter._bot_user_id = "UBOT"
     adapter._team_bot_user_ids["T1"] = "UBOT"
+    adapter._team_clients["T1"] = AsyncMock()
     adapter._has_active_session_for_thread = lambda **_: False
 
     async def no_thread_context(**_):
@@ -64,21 +66,24 @@ def test_thread_require_mention_parses_yaml_and_env(monkeypatch):
 
     assert make_adapter()._slack_thread_require_mention() is True
     assert (
-        make_adapter({"thread_require_mention": "false"})._slack_thread_require_mention()
+        make_adapter({
+            "thread_require_mention": "false"
+        })._slack_thread_require_mention()
         is False
     )
-    assert make_adapter({"thread_require_mention": True})._slack_thread_require_mention() is True
+    assert (
+        make_adapter({"thread_require_mention": True})._slack_thread_require_mention()
+        is True
+    )
 
 
 def test_thread_require_mention_allows_top_level_free_response():
-    adapter = make_adapter(
-        {
-            "allowed_channels": ["C123"],
-            "require_mention": False,
-            "thread_require_mention": True,
-            "reply_in_thread": True,
-        }
-    )
+    adapter = make_adapter({
+        "allowed_channels": ["C123"],
+        "require_mention": False,
+        "thread_require_mention": True,
+        "reply_in_thread": True,
+    })
     handled = []
 
     async def capture(event):
@@ -94,14 +99,12 @@ def test_thread_require_mention_allows_top_level_free_response():
 
 
 def test_thread_require_mention_blocks_unmentioned_thread_reply():
-    adapter = make_adapter(
-        {
-            "allowed_channels": ["C123"],
-            "require_mention": False,
-            "thread_require_mention": True,
-            "reply_in_thread": True,
-        }
-    )
+    adapter = make_adapter({
+        "allowed_channels": ["C123"],
+        "require_mention": False,
+        "thread_require_mention": True,
+        "reply_in_thread": True,
+    })
     handled = []
 
     async def capture(event):
@@ -119,14 +122,12 @@ def test_thread_require_mention_blocks_unmentioned_thread_reply():
 
 
 def test_thread_require_mention_allows_mentioned_thread_reply_without_sticky_thread():
-    adapter = make_adapter(
-        {
-            "allowed_channels": ["C123"],
-            "require_mention": False,
-            "thread_require_mention": True,
-            "reply_in_thread": True,
-        }
-    )
+    adapter = make_adapter({
+        "allowed_channels": ["C123"],
+        "require_mention": False,
+        "thread_require_mention": True,
+        "reply_in_thread": True,
+    })
     handled = []
 
     async def capture(event):

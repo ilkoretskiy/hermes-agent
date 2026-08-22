@@ -18,6 +18,7 @@ from gateway.config import Platform, PlatformConfig
 # Mock slack-bolt if not installed (same as test_slack.py)
 # ---------------------------------------------------------------------------
 
+
 def _ensure_slack_mock():
     if "slack_bolt" in sys.modules and hasattr(sys.modules["slack_bolt"], "__file__"):
         return
@@ -34,7 +35,10 @@ def _ensure_slack_mock():
         ("slack_bolt.async_app", slack_bolt.async_app),
         ("slack_bolt.adapter", slack_bolt.adapter),
         ("slack_bolt.adapter.socket_mode", slack_bolt.adapter.socket_mode),
-        ("slack_bolt.adapter.socket_mode.async_handler", slack_bolt.adapter.socket_mode.async_handler),
+        (
+            "slack_bolt.adapter.socket_mode.async_handler",
+            slack_bolt.adapter.socket_mode.async_handler,
+        ),
         ("slack_sdk", slack_sdk),
         ("slack_sdk.web", slack_sdk.web),
         ("slack_sdk.web.async_client", slack_sdk.web.async_client),
@@ -45,6 +49,7 @@ def _ensure_slack_mock():
 _ensure_slack_mock()
 
 import plugins.platforms.slack.adapter as _slack_mod
+
 _slack_mod.SLACK_AVAILABLE = True
 
 from plugins.platforms.slack.adapter import SlackAdapter  # noqa: E402
@@ -59,8 +64,13 @@ CHANNEL_ID = "C0AQWDLHY9M"
 OTHER_CHANNEL_ID = "C9999999999"
 
 
-def _make_adapter(require_mention=None, strict_mention=None, free_response_channels=None,
-                  allowed_channels=None, mention_patterns=None):
+def _make_adapter(
+    require_mention=None,
+    strict_mention=None,
+    free_response_channels=None,
+    allowed_channels=None,
+    mention_patterns=None,
+):
     extra = {}
     if require_mention is not None:
         extra["require_mention"] = require_mention
@@ -85,6 +95,7 @@ def _make_adapter(require_mention=None, strict_mention=None, free_response_chann
 # Tests: _slack_require_mention
 # ---------------------------------------------------------------------------
 
+
 def test_require_mention_defaults_to_true(monkeypatch):
     monkeypatch.delenv("SLACK_REQUIRE_MENTION", raising=False)
     adapter = _make_adapter()
@@ -100,6 +111,7 @@ def test_require_mention_empty_string_stays_true():
 # ---------------------------------------------------------------------------
 # Tests: _slack_strict_mention
 # ---------------------------------------------------------------------------
+
 
 def test_strict_mention_defaults_to_false(monkeypatch):
     monkeypatch.delenv("SLACK_STRICT_MENTION", raising=False)
@@ -119,7 +131,9 @@ def test_strict_mention_malformed_stays_false():
 
 
 def test_free_response_channels_env_var_fallback(monkeypatch):
-    monkeypatch.setenv("SLACK_FREE_RESPONSE_CHANNELS", f"{CHANNEL_ID},{OTHER_CHANNEL_ID}")
+    monkeypatch.setenv(
+        "SLACK_FREE_RESPONSE_CHANNELS", f"{CHANNEL_ID},{OTHER_CHANNEL_ID}"
+    )
     adapter = _make_adapter()  # no config value → falls back to env
     result = adapter._slack_free_response_channels()
     assert CHANNEL_ID in result
@@ -140,9 +154,18 @@ def test_free_response_channels_bare_int():
 # Tests: mention gating integration (simulating _handle_slack_message logic)
 # ---------------------------------------------------------------------------
 
-def _would_process(adapter, *, is_dm=False, channel_id=CHANNEL_ID,
-                   text="hello", mentioned=False, thread_reply=False,
-                   active_session=False, channel_type=None):
+
+def _would_process(
+    adapter,
+    *,
+    is_dm=False,
+    channel_id=CHANNEL_ID,
+    text="hello",
+    mentioned=False,
+    thread_reply=False,
+    active_session=False,
+    channel_type=None,
+):
     """Simulate the mention gating logic from _handle_slack_message.
 
     Returns True if the message would be processed, False if it would be
@@ -218,6 +241,7 @@ def test_dm_always_processed_regardless_of_setting():
 # mpim as a DM and thereby exempted it from mention gating + reaction guards).
 # ---------------------------------------------------------------------------
 
+
 def _reaction_guard(channel_type, is_mentioned):
     """Mirror of the production reaction guard in ``_handle_slack_message``:
 
@@ -235,8 +259,16 @@ def test_mpim_not_in_allowed_channels_dropped():
     """MPIM absent from a non-empty allowed_channels whitelist is dropped,
     even when mentioned."""
     adapter = _make_adapter(require_mention=True, allowed_channels=["C_ALLOWED"])
-    assert _would_process(adapter, channel_type="mpim", channel_id="C_BLOCKED",
-                          mentioned=True, text="hello") is False
+    assert (
+        _would_process(
+            adapter,
+            channel_type="mpim",
+            channel_id="C_BLOCKED",
+            mentioned=True,
+            text="hello",
+        )
+        is False
+    )
 
 
 def test_one_to_one_im_still_exempt():
@@ -248,10 +280,10 @@ def test_one_to_one_im_still_exempt():
 def test_mpim_unmentioned_does_not_react():
     """Reaction guard: only a 1:1 IM or an @mention earns a reaction. An
     unmentioned MPIM message must NOT get :eyes:/:white_check_mark: noise."""
-    assert _reaction_guard("mpim", False) is False   # the reported spam case
-    assert _reaction_guard("mpim", True) is True      # addressed -> ok
-    assert _reaction_guard("im", False) is True        # 1:1 DM -> ok
-    assert _reaction_guard("", False) is False         # channel, unmentioned
+    assert _reaction_guard("mpim", False) is False  # the reported spam case
+    assert _reaction_guard("mpim", True) is True  # addressed -> ok
+    assert _reaction_guard("im", False) is True  # 1:1 DM -> ok
+    assert _reaction_guard("", False) is False  # channel, unmentioned
 
 
 def test_reaction_guard_pinned_to_production_expression():
@@ -280,18 +312,28 @@ def test_mentioned_message_always_processed():
 
 def test_thread_reply_with_active_session_processed():
     adapter = _make_adapter(require_mention=True)
-    assert _would_process(
-        adapter, text="followup",
-        thread_reply=True, active_session=True,
-    ) is True
+    assert (
+        _would_process(
+            adapter,
+            text="followup",
+            thread_reply=True,
+            active_session=True,
+        )
+        is True
+    )
 
 
 def test_thread_reply_without_active_session_ignored():
     adapter = _make_adapter(require_mention=True)
-    assert _would_process(
-        adapter, text="followup",
-        thread_reply=True, active_session=False,
-    ) is False
+    assert (
+        _would_process(
+            adapter,
+            text="followup",
+            thread_reply=True,
+            active_session=False,
+        )
+        is False
+    )
 
 
 def test_bot_uid_none_processes_channel_message():
@@ -323,6 +365,7 @@ def test_bot_uid_none_processes_channel_message():
 # Tests: config bridging
 # ---------------------------------------------------------------------------
 
+
 def test_config_bridges_slack_free_response_channels(monkeypatch, tmp_path):
     from gateway.config import load_gateway_config
 
@@ -349,6 +392,7 @@ def test_config_bridges_slack_free_response_channels(monkeypatch, tmp_path):
     assert slack_extra.get("free_response_channels") == ["C0AQWDLHY9M", "C9999999999"]
     # Verify env vars were set by config bridging
     import os as _os
+
     assert _os.environ["SLACK_REQUIRE_MENTION"] == "false"
     assert _os.environ["SLACK_FREE_RESPONSE_CHANNELS"] == "C0AQWDLHY9M,C9999999999"
     _os.environ.pop("SLACK_REQUIRE_MENTION", None)
@@ -361,8 +405,7 @@ def test_top_level_slack_settings_do_not_disable_env_token_setup(monkeypatch, tm
     hermes_home = tmp_path / ".hermes"
     hermes_home.mkdir()
     (hermes_home / "config.yaml").write_text(
-        "slack:\n"
-        "  require_mention: false\n",
+        "slack:\n  require_mention: false\n",
         encoding="utf-8",
     )
 
@@ -379,7 +422,9 @@ def test_top_level_slack_settings_do_not_disable_env_token_setup(monkeypatch, tm
     assert "_enabled_explicit" not in slack_config.extra
 
 
-def test_explicit_platforms_slack_enabled_false_wins_over_env_token(monkeypatch, tmp_path):
+def test_explicit_platforms_slack_enabled_false_wins_over_env_token(
+    monkeypatch, tmp_path
+):
     from gateway.config import load_gateway_config
 
     hermes_home = tmp_path / ".hermes"
@@ -411,8 +456,7 @@ def test_config_bridges_slack_reply_in_thread(monkeypatch, tmp_path):
     hermes_home = tmp_path / ".hermes"
     hermes_home.mkdir()
     (hermes_home / "config.yaml").write_text(
-        "slack:\n"
-        "  reply_in_thread: false\n",
+        "slack:\n  reply_in_thread: false\n",
         encoding="utf-8",
     )
 
@@ -432,17 +476,23 @@ def test_config_bridges_slack_reply_in_thread(monkeypatch, tmp_path):
     # because the inbound handler uses event.ts as a session-keying fallback.
     # Those must be treated as non-threaded so reply_in_thread=false takes
     # effect in channels, not just DMs.
-    assert adapter._resolve_thread_ts(
-        reply_to="171.000",
-        metadata={"thread_id": "171.000"},
-    ) is None
+    assert (
+        adapter._resolve_thread_ts(
+            reply_to="171.000",
+            metadata={"thread_id": "171.000"},
+        )
+        is None
+    )
 
     # Real thread replies (reply_to differs from thread parent) must still
     # resolve to the parent thread so conversation context is preserved.
-    assert adapter._resolve_thread_ts(
-        reply_to="171.500",
-        metadata={"thread_id": "171.000"},
-    ) == "171.000"
+    assert (
+        adapter._resolve_thread_ts(
+            reply_to="171.500",
+            metadata={"thread_id": "171.000"},
+        )
+        == "171.000"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -451,6 +501,7 @@ def test_config_bridges_slack_reply_in_thread(monkeypatch, tmp_path):
 # Prevents agent-to-agent ack loops — if a strict-mode bot remembered every
 # thread it was mentioned in, the next message from the other agent in that
 # thread would re-trigger the bot and defeat the entire feature.
+
 
 def test_mention_in_strict_mode_does_not_register_thread():
     adapter = _make_adapter(strict_mention=True)
@@ -502,6 +553,7 @@ def test_allowed_channels_env_var_blocks_channel(monkeypatch):
 async def test_block_extraction_debug_log_does_not_include_message_preview(caplog):
     secret_block_text = "private incident token: customer-id-12345"
     adapter = _make_adapter(allowed_channels=[CHANNEL_ID])
+    adapter._team_clients = {"T1": AsyncMock()}
     adapter._dedup = MagicMock(is_duplicate=MagicMock(return_value=False))
     adapter._lookup_assistant_thread_metadata = MagicMock(return_value={})
     adapter._channel_team = {}

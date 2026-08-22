@@ -30,11 +30,7 @@ def _make_adapter(extra=None):
 
 
 RICH_MD = "# Title\n\n- a\n  - nested\n\n---\n\nbody text"
-RICH_TABLE_MD = (
-    "| Item | Status | Note |\n"
-    "|---|---:|---|\n"
-    "| Hermes | ok | table |"
-)
+RICH_TABLE_MD = "| Item | Status | Note |\n|---|---:|---|\n| Hermes | ok | table |"
 
 
 class SlackRejectedBlocks(Exception):
@@ -66,7 +62,6 @@ class TestSendMessageBlocks:
         assert "blocks" not in kwargs
         assert kwargs["text"]  # plain text still sent
 
-
     @pytest.mark.asyncio
     async def test_enabled_but_unrenderable_falls_back_to_text(self):
         # 60 dividers -> renderer returns None -> no blocks kwarg, text stands
@@ -75,7 +70,6 @@ class TestSendMessageBlocks:
         kwargs = client.chat_postMessage.await_args.kwargs
         assert "blocks" not in kwargs
         assert kwargs["text"]
-
 
     @pytest.mark.asyncio
     async def test_feedback_buttons_opt_in_appended_to_blocks(self):
@@ -107,9 +101,10 @@ class TestEditMessageBlocks:
         assert "blocks" in kwargs and kwargs["blocks"]
         assert kwargs["text"]
 
-
     @pytest.mark.asyncio
-    async def test_block_rejection_retries_edit_without_blocks_using_workspace_client(self):
+    async def test_block_rejection_retries_edit_without_blocks_using_workspace_client(
+        self,
+    ):
         adapter, client = _make_adapter({"rich_blocks": True})
         client.chat_update = AsyncMock(
             side_effect=[SlackRejectedBlocks("invalid_blocks"), {"ts": "111.222"}]
@@ -175,7 +170,6 @@ class TestMarkdownBlockMode:
         # mrkdwn fallback text is still present for notifications/search
         assert kwargs["text"]
 
-
     @pytest.mark.asyncio
     async def test_edit_finalize_uses_markdown_block(self):
         adapter, client = _make_adapter({"markdown_blocks": True})
@@ -184,4 +178,38 @@ class TestMarkdownBlockMode:
         assert kwargs["blocks"][0]["type"] == "markdown"
         assert kwargs["blocks"][0]["text"] == RICH_TABLE_MD
 
+    @pytest.mark.asyncio
+    async def test_rejected_markdown_block_retries_send_without_blocks(self):
+        adapter, client = _make_adapter({"markdown_blocks": True})
+        client.chat_postMessage = AsyncMock(
+            side_effect=[SlackRejectedBlocks("invalid_blocks"), {"ts": "111.222"}]
+        )
 
+        result = await adapter.send(
+            "C1",
+            RICH_TABLE_MD,
+            metadata={"team_id": "T_SECONDARY"},
+        )
+
+        assert result.success is True
+        assert adapter._get_client.call_args_list == [
+            call("C1", team_id="T_SECONDARY"),
+            call("C1", team_id="T_SECONDARY"),
+        ]
+        assert client.chat_postMessage.await_count == 2
+        first = client.chat_postMessage.await_args_list[0].kwargs
+        second = client.chat_postMessage.await_args_list[1].kwargs
+        assert first["blocks"][0]["type"] == "markdown"
+        assert "blocks" not in second
+        assert second["text"]
+
+    @pytest.mark.asyncio
+    async def test_over_limit_markdown_falls_back_to_text(self):
+        adapter, client = _make_adapter({"markdown_blocks": True})
+        over_limit = "x" * (adapter._MARKDOWN_BLOCK_MAX + 1)
+
+        await adapter.send("C1", over_limit)
+
+        kwargs = client.chat_postMessage.await_args.kwargs
+        assert "blocks" not in kwargs
+        assert kwargs["text"] == over_limit
