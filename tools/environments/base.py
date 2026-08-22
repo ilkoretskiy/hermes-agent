@@ -112,8 +112,15 @@ class _BoundedOutputCollector:
             return
         try:
             if self._spill_fh is None:
-                self._spill_path.parent.mkdir(parents=True, exist_ok=True)
-                self._spill_fh = open(self._spill_path, "w", encoding="utf-8", errors="replace")
+                from tools.spill_safety import ensure_spill_dir, open_exclusive
+
+                # Raw pre-redaction output: private perms + symlink-refusing
+                # exclusive create (a planted link must fail the spill, never
+                # redirect the write).
+                ensure_spill_dir(self._spill_path.parent, private=True)
+                self._spill_fh = open_exclusive(
+                    self._spill_path, private=True, errors="replace"
+                )
                 # Backfill everything retained so far so the file holds the
                 # stream from byte 0, not just from the overflow point.
                 backlog = "".join(self._head) + "".join(self._tail)
@@ -522,7 +529,8 @@ def _cwd_marker(session_id: str) -> str:
 # as the Python-side contract for the exclusion set; the dump path unsets by
 # name/prefix instead of grepping declare lines (see below / issue #71296).
 _SNAPSHOT_EXCLUDED_ENV_REGEX = (
-    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_|HERMES_CRON_SESSION)"
+    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_|"
+    "HERMES_CRON_SESSION|HERMES_BROWSER_CONTROL_)"
 )
 _SHELL_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -566,6 +574,7 @@ def _export_dump_excluding_session_vars(
     return (
         "{ ( "
         "unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
+        "${!HERMES_BROWSER_CONTROL_*} "
         # AI_AGENT / HERMES_AGENT are per-command attribution markers
         # (re-exported by every _wrap_command with outer-harness-preserving
         # ${VAR:-default} semantics).  Persisting them into the snapshot
@@ -1333,6 +1342,13 @@ class BaseEnvironment(ABC):
 
         Updates self.cwd and strips the marker from result["output"].
         Used by remote backends (Docker, SSH, Modal, Daytona, Singularity).
+
+        Sets ``result["cwd_observed"]`` when the marker yielded a directory for
+        THIS command. The wrapper prints the marker after the command returns,
+        so a killed / timed-out command never emits one and ``self.cwd`` keeps
+        whatever the previous command left there. That environment is shared by
+        every session, so callers must not attribute an unobserved cwd to the
+        session that ran this command (see terminal_tool's session-cwd record).
         """
         output = result.get("output", "")
         marker = self._cwd_marker
@@ -1349,6 +1365,7 @@ class BaseEnvironment(ABC):
         cwd_path = output[first + len(marker) : last].strip()
         if cwd_path:
             self.cwd = cwd_path
+            result["cwd_observed"] = True
 
         # Strip the marker line AND the \n we injected before it.
         # The wrapper emits: printf '\n__MARKER__%s__MARKER__\n'
