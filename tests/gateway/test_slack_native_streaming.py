@@ -46,6 +46,12 @@ def _make_adapter(extra=None):
 META = {"thread_id": "111.000", "user_id": "U123"}
 
 
+class SlackRejectedBlocks(Exception):
+    def __init__(self, error="msg_too_long"):
+        super().__init__(f"Slack API rejected blocks: {error}")
+        self.response = {"error": error}
+
+
 class TestSupportsDraftStreaming:
     def test_supported_when_connected(self):
         adapter, _ = _make_adapter()
@@ -600,6 +606,73 @@ class TestSendFinalization:
         assert client.chat_stopStream.await_count == 1
         client.chat_postMessage.assert_not_awaited()
         assert not adapter._active_streams
+
+    @pytest.mark.asyncio
+    async def test_rewritten_final_block_rejection_retries_same_stream_without_blocks(
+        self,
+    ):
+        adapter, client = _make_adapter({"markdown_blocks": True})
+        metadata = {**META, "scope_id": "T_SECONDARY"}
+        await adapter.send_draft("D1", 7, "Draft preview", metadata=metadata)
+        client.chat_update = AsyncMock(
+            side_effect=[
+                SlackRejectedBlocks("msg_too_long"),
+                {"ok": True, "ts": "123.456"},
+            ]
+        )
+
+        result = await adapter.send(
+            "D1",
+            "# Authoritative final\n\nPlain fallback body",
+            metadata={**metadata, "notify": True},
+        )
+
+        assert result.success
+        assert result.message_id == "123.456"
+        assert client.chat_update.await_count == 2
+        first = client.chat_update.await_args_list[0].kwargs
+        second = client.chat_update.await_args_list[1].kwargs
+        assert first["channel"] == second["channel"] == "D1"
+        assert first["ts"] == second["ts"] == "123.456"
+        assert first["blocks"]
+        assert second["blocks"] == []
+        assert second["text"] == first["text"]
+        get_client = adapter._get_client
+        assert isinstance(get_client, MagicMock)
+        assert {call.kwargs.get("team_id") for call in get_client.call_args_list} == {
+            "T_SECONDARY"
+        }
+        client.chat_postMessage.assert_not_awaited()
+        assert not adapter._active_streams
+
+    @pytest.mark.asyncio
+    async def test_rewritten_final_plain_fallback_failure_keeps_stream_for_retry(
+        self,
+    ):
+        adapter, client = _make_adapter({"markdown_blocks": True})
+        await adapter.send_draft("D1", 7, "Draft preview", metadata=META)
+        client.chat_update = AsyncMock(
+            side_effect=[
+                SlackRejectedBlocks("msg_too_long"),
+                TimeoutError("plain fallback timed out"),
+            ]
+        )
+
+        result = await adapter.send(
+            "D1",
+            "# Authoritative final\n\nPlain fallback body",
+            metadata={**META, "notify": True},
+        )
+
+        assert not result.success
+        assert result.retryable
+        assert result.message_id == "123.456"
+        assert result.error is not None
+        assert "plain fallback timed out" in result.error
+        assert client.chat_update.await_count == 2
+        assert client.chat_update.await_args_list[1].kwargs["blocks"] == []
+        client.chat_postMessage.assert_not_awaited()
+        assert next(iter(adapter._active_streams.values()))["stopped"] is True
 
     @pytest.mark.asyncio
     async def test_final_send_seals_stream_no_duplicate_post(self):

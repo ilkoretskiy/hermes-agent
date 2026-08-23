@@ -3693,10 +3693,26 @@ class SlackAdapter(BasePlatformAdapter):
                 }
                 if blocks:
                     update_kwargs["blocks"] = blocks
-                await self._get_client(
+                stream_client = self._get_client(
                     chat_id,
                     team_id=str(stream.get("team_id") or ""),
-                ).chat_update(**update_kwargs)
+                )
+                try:
+                    await stream_client.chat_update(**update_kwargs)
+                except Exception as e:
+                    if update_kwargs.get("blocks") and self._is_block_payload_rejection(
+                        e
+                    ):
+                        retry_kwargs = dict(update_kwargs)
+                        retry_kwargs["blocks"] = []
+                        logger.info(
+                            "[Slack] Native stream Block Kit payload rejected; "
+                            "retrying final update without blocks: %s",
+                            e,
+                        )
+                        await stream_client.chat_update(**retry_kwargs)
+                    else:
+                        raise
             except Exception as e:
                 logger.debug(
                     "[Slack] Post-stream final update failed: %s",
