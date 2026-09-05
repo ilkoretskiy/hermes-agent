@@ -1434,22 +1434,47 @@ class TestSuppressionSideEffects:
 
 
 class TestConfigAndPatterns:
+    @pytest.mark.parametrize(
+        "yaml_text",
+        [
+            (
+                "slack:\n"
+                "  require_mention: true\n"
+                "  thread_routing:\n"
+                "    enabled: true\n"
+                "    stop_patterns:\n"
+                "      - quiet please\n"
+            ),
+            (
+                "platforms:\n"
+                "  slack:\n"
+                "    require_mention: true\n"
+                "    thread_routing:\n"
+                "      enabled: true\n"
+                "      stop_patterns:\n"
+                "        - quiet please\n"
+            ),
+            (
+                "gateway:\n"
+                "  platforms:\n"
+                "    slack:\n"
+                "      require_mention: true\n"
+                "      thread_routing:\n"
+                "        enabled: true\n"
+                "        stop_patterns:\n"
+                "          - quiet please\n"
+            ),
+        ],
+        ids=["top-level", "platforms", "gateway-platforms"],
+    )
     def test_slack_thread_routing_config_is_bridged_into_platform_extra(
-        self, tmp_path, monkeypatch
+        self, tmp_path, monkeypatch, yaml_text
     ):
         from gateway.config import Platform, load_gateway_config
 
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
-        (hermes_home / "config.yaml").write_text(
-            "slack:\n"
-            "  require_mention: true\n"
-            "  thread_routing:\n"
-            "    enabled: true\n"
-            "    stop_patterns:\n"
-            "      - quiet please\n",
-            encoding="utf-8",
-        )
+        (hermes_home / "config.yaml").write_text(yaml_text, encoding="utf-8")
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
         config = load_gateway_config()

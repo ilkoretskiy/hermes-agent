@@ -566,6 +566,53 @@ class TestSlackWorkspaceCollisionIsolation:
         assert "D_SHARED" not in adapter._channel_team
 
     @pytest.mark.asyncio
+    async def test_message_changed_claim_is_scoped_by_workspace(self, adapter):
+        """A Slack-local ts claimed in one workspace must not suppress another."""
+        team_one, team_two = AsyncMock(), AsyncMock()
+        team_one.users_info = AsyncMock(
+            return_value={"user": {"profile": {"display_name": "Alice"}}}
+        )
+        team_two.users_info = AsyncMock(
+            return_value={"user": {"profile": {"display_name": "Bob"}}}
+        )
+        adapter._team_clients.update({"T_ONE": team_one, "T_TWO": team_two})
+        message_ts = "171.500"
+
+        await adapter._handle_slack_message(
+            {
+                "text": "first workspace message",
+                "user": "U_SHARED",
+                "channel": "D_SHARED",
+                "channel_type": "im",
+                "ts": message_ts,
+            },
+            {"team_id": "T_ONE"},
+        )
+        await adapter._handle_slack_message(
+            {
+                "subtype": "message_changed",
+                "channel": "D_SHARED",
+                "channel_type": "im",
+                "event_ts": "171.501",
+                "message": {
+                    "text": "second workspace edited message",
+                    "user": "U_SHARED",
+                    "channel": "D_SHARED",
+                    "channel_type": "im",
+                    "ts": message_ts,
+                    "edited": {"user": "U_SHARED", "ts": "171.501"},
+                },
+            },
+            {"team_id": "T_TWO"},
+        )
+
+        assert adapter.handle_message.await_count == 2
+        first = adapter.handle_message.await_args_list[0].args[0]
+        second = adapter.handle_message.await_args_list[1].args[0]
+        assert first.source.scope_id == "T_ONE"
+        assert second.source.scope_id == "T_TWO"
+
+    @pytest.mark.asyncio
     async def test_teamless_dm_in_scoped_runtime_is_suppressed_before_lookup(
         self, adapter
     ):
