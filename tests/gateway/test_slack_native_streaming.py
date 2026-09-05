@@ -1,8 +1,9 @@
 """Tests: SlackAdapter native streaming (chat.startStream/appendStream/stopStream).
 
 Behaviour contract:
-  * supports_draft_streaming: True when connected, False after a cached
-    feature-gate failure or when disconnected.
+  * supports_draft_streaming: True when connected with default unfurl behavior;
+    False after a cached feature-gate failure, when disconnected, or when an
+    explicit unfurl control requires the chat.postMessage fallback.
   * send_draft first frame: chat_startStream with thread_ts + initial text;
     returns the stream ts as message_id.
   * send_draft subsequent frames: chat_appendStream with only the delta;
@@ -57,6 +58,22 @@ class TestSupportsDraftStreaming:
         adapter, _ = _make_adapter()
         assert adapter.supports_draft_streaming(chat_type="dm") is True
 
+    @pytest.mark.parametrize(
+        ("unfurl_key", "configured_value"),
+        [
+            ("unfurl_links", False),
+            ("unfurl_links", True),
+            ("unfurl_media", False),
+            ("unfurl_media", True),
+        ],
+    )
+    def test_explicit_unfurl_control_disables_native_streaming(
+        self, unfurl_key, configured_value
+    ):
+        adapter, _ = _make_adapter({unfurl_key: configured_value})
+
+        assert adapter.supports_draft_streaming(chat_type="dm") is False
+
     def test_unsupported_when_disconnected(self):
         adapter, _ = _make_adapter()
         adapter._app = None
@@ -93,6 +110,76 @@ class TestSendDraft:
         assert kwargs["ts"] == "123.456"
 
     @pytest.mark.asyncio
+    async def test_ambiguous_append_finalizes_without_reissuing_delta(self):
+        adapter, client = _make_adapter()
+        await adapter.send_draft("D1", 7, "Hello", metadata=META)
+        client.chat_appendStream = AsyncMock(side_effect=Exception("append timeout"))
+
+        frame = await adapter.send_draft("D1", 7, "Hello world", metadata=META)
+
+        assert not frame.success
+        assert frame.retryable
+        assert frame.message_id == "123.456"
+        assert next(iter(adapter._active_streams.values()))["sent"] == "Hello"
+
+        final = await adapter.send(
+            "D1",
+            "Hello world",
+            metadata={**META, "notify": True},
+        )
+
+        assert final.success
+        assert final.message_id == "123.456"
+        stop_kwargs = client.chat_stopStream.await_args.kwargs
+        assert stop_kwargs["ts"] == "123.456"
+        assert "markdown_text" not in stop_kwargs
+        client.chat_update.assert_awaited_once_with(
+            channel="D1",
+            ts="123.456",
+            text="Hello world",
+        )
+        client.chat_postMessage.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_append_update_failure_retries_same_message(self):
+        adapter, client = _make_adapter()
+        await adapter.send_draft("D1", 7, "Hello", metadata=META)
+        client.chat_appendStream = AsyncMock(side_effect=Exception("append timeout"))
+        await adapter.send_draft("D1", 7, "Hello world", metadata=META)
+        client.chat_update = AsyncMock(side_effect=Exception("update timeout"))
+
+        first = await adapter.send(
+            "D1",
+            "Hello world",
+            metadata={**META, "notify": True},
+        )
+
+        assert not first.success
+        assert first.retryable
+        assert first.message_id == "123.456"
+        assert next(iter(adapter._active_streams.values()))["stopped"] is True
+        assert client.chat_stopStream.await_count == 1
+        client.chat_postMessage.assert_not_awaited()
+
+        client.chat_update = AsyncMock(return_value={"ok": True, "ts": "123.456"})
+        retry = await adapter.send(
+            "D1",
+            "Hello world",
+            metadata={**META, "notify": True},
+        )
+
+        assert retry.success
+        assert retry.message_id == "123.456"
+        assert client.chat_stopStream.await_count == 1
+        client.chat_update.assert_awaited_once_with(
+            channel="D1",
+            ts="123.456",
+            text="Hello world",
+        )
+        client.chat_postMessage.assert_not_awaited()
+        assert not adapter._active_streams
+
+    @pytest.mark.asyncio
     async def test_cursor_glyph_stripped(self):
         adapter, client = _make_adapter()
         await adapter.send_draft("D1", 7, "Hello \u2589", metadata=META)
@@ -118,6 +205,23 @@ class TestSendDraft:
         assert not adapter._active_streams
 
     @pytest.mark.asyncio
+    async def test_prefix_mismatch_failed_seal_preserves_stream_for_retry(self):
+        adapter, client = _make_adapter()
+        await adapter.send_draft("D1", 7, "Hello", metadata=META)
+        client.chat_stopStream = AsyncMock(side_effect=Exception("stop timeout"))
+
+        result = await adapter.send_draft(
+            "D1", 7, "Rewritten text", metadata=META
+        )
+
+        assert not result.success
+        assert result.retryable
+        assert result.message_id == "123.456"
+        assert next(iter(adapter._active_streams.values()))["ts"] == "123.456"
+        assert client.chat_startStream.await_count == 1
+        client.chat_postMessage.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_no_thread_ts_fails_cleanly(self):
         adapter, client = _make_adapter()
         result = await adapter.send_draft("D1", 7, "Hello", metadata={})
@@ -133,6 +237,28 @@ class TestSendDraft:
         assert result.success
         client.chat_stopStream.assert_awaited()  # sealed segment one
         assert next(iter(adapter._active_streams.values()))["ts"] == "124.000"
+
+    @pytest.mark.asyncio
+    async def test_new_draft_id_failed_seal_does_not_start_second_stream(self):
+        adapter, client = _make_adapter()
+        await adapter.send_draft("D1", 7, "Segment one", metadata=META)
+        client.chat_stopStream = AsyncMock(side_effect=Exception("stop timeout"))
+        client.chat_startStream.return_value = {"ok": True, "ts": "124.000"}
+
+        result = await adapter.send_draft("D1", 8, "Segment two", metadata=META)
+
+        assert not result.success
+        assert result.retryable
+        assert result.message_id == "123.456"
+        assert client.chat_startStream.await_count == 1
+        assert next(iter(adapter._active_streams.values()))["ts"] == "123.456"
+
+        client.chat_stopStream = AsyncMock(return_value={"ok": True})
+        retry = await adapter.send_draft("D1", 8, "Segment two", metadata=META)
+
+        assert retry.success
+        assert retry.message_id == "124.000"
+        assert client.chat_startStream.await_count == 2
 
 
 class TestFeatureGateFallback:

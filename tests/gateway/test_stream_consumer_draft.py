@@ -234,6 +234,49 @@ class TestDraftFallbackOnFailure:
         # Final message delivered via the regular send path.
         adapter.send.assert_awaited()
 
+    @pytest.mark.asyncio
+    async def test_failed_frame_still_allows_native_stream_abandonment(self):
+        from gateway.platforms.base import SendResult
+
+        adapter = _make_draft_capable_adapter()
+        adapter.send_draft = AsyncMock(
+            side_effect=[
+                SendResult(success=True, message_id="stream-1"),
+                SendResult(
+                    success=False,
+                    message_id="stream-1",
+                    error="append timeout",
+                    retryable=True,
+                ),
+            ]
+        )
+        abandon_calls = []
+
+        async def _abandon_open_draft(
+            self, chat_id, content, metadata=None
+        ):  # noqa: ANN001
+            abandon_calls.append((chat_id, content, metadata))
+
+        setattr(type(adapter), "abandon_open_draft", _abandon_open_draft)
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "C1",
+            StreamConsumerConfig(transport="auto", chat_type="dm", cursor=""),
+            metadata={"message_id": "turn-1"},
+        )
+        consumer._draft_id = 7
+        consumer._use_draft_streaming = True
+
+        assert await consumer._send_draft_frame("Hello") is True
+        assert await consumer._send_draft_frame("Hello world") is False
+        assert consumer._use_draft_streaming is False
+
+        await consumer._abandon_native_stream()
+
+        assert abandon_calls == [
+            ("C1", "Hello", {"message_id": "turn-1"}),
+        ]
+
 
 class TestDraftIdLifecycle:
     """Each response gets its own draft_id (no animation collision across
