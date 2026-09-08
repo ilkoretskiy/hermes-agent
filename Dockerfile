@@ -95,7 +95,14 @@ RUN install -d -m 0755 /etc/apt/keyrings && \
 # statically-linked Go binary — no apt deps. Keeping bd in the image (not in
 # the persistent tools volume) so a fresh container always has it.
 # https://github.com/gastownhall/beads
-ARG BD_VERSION=1.0.4
+#
+# Moving this version migrates data, it does not just swap a binary: beads
+# migrates its schema on the first ORDINARY command, and five live .beads
+# databases are reachable from this container. The same version must be running
+# on the Mac, or whichever side migrates first locks the other out of the
+# shared repos/enotim-vps tracker with `schema version mismatch`. All five were
+# exported before this bump (2026-09-08, 412 issues) — see RUNBOOK finding #21.
+ARG BD_VERSION=1.2.2
 RUN curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors "https://github.com/gastownhall/beads/releases/download/v${BD_VERSION}/beads_${BD_VERSION}_linux_amd64.tar.gz" \
       | tar -xz -C /usr/local/bin bd \
     && bd --version
@@ -321,7 +328,21 @@ RUN uv pip install --no-cache-dir --no-deps -e "."
 # korikori memory provider. Install as root while /opt/hermes/.venv is still
 # writable — the COPY --chmod above only drops group/other write (go-w); root
 # still writes, so this layer succeeds before the runtime drops to the hermes user.
-RUN uv pip install --no-cache-dir "mnemosyne-memory[embeddings]==3.4.0" "mnemosyne-hermes==0.1.5"
+#
+# 3.15.1 / 0.5.0 was rehearsed on 2026-09-08 against a copy of the live 32M
+# korikori-main memory DB before being pinned here. Both hazards the 3.4 -> 3.15
+# changelog warns about turned out inert for this database: the v3.9
+# memory_events/audit_log name collision resolved by extending our existing
+# table in place (21 rows kept, four sync columns added, no audit_log created),
+# and the v3.12 startup gate on custom embedding endpoints does not fire because
+# text-embedding-3-small is in the built-in dimension table — so
+# MNEMOSYNE_EMBEDDING_DIM stays unset. Row counts identical across the migration
+# (9 memories / 603 working / 95 episodic / 49 facts), integrity check passed,
+# and store+recall verified against the real endpoint.
+#
+# mnemosyne-hermes 0.5.0 requires mnemosyne-memory>=3.11.1: these two move
+# together or not at all.
+RUN uv pip install --no-cache-dir "mnemosyne-memory[embeddings]==3.15.1" "mnemosyne-hermes==0.5.0"
 
 # Wire the exec shim and install-method stamp.  Files under /opt/hermes are
 # already root-owned (COPY, uv sync, npm install all run as root) and
