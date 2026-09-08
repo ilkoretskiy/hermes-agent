@@ -98,10 +98,16 @@ RUN install -d -m 0755 /etc/apt/keyrings && \
 #
 # Moving this version migrates data, it does not just swap a binary: beads
 # migrates its schema on the first ORDINARY command, and five live .beads
-# databases are reachable from this container. The same version must be running
-# on the Mac, or whichever side migrates first locks the other out of the
-# shared repos/enotim-vps tracker with `schema version mismatch`. All five were
-# exported before this bump (2026-09-08, 412 issues) — see RUNBOOK finding #21.
+# databases are reachable from this container. The migration is one-way, so all
+# five were exported first (2026-09-08, 412 issues) — see RUNBOOK finding #21.
+#
+# The Mac is NOT sharing a database with this container, contrary to what the
+# first draft of this comment claimed: .beads/embeddeddolt is gitignored, so
+# each clone carries its own store and only issues.jsonl travels through git.
+# Both sides were still moved to 1.2.2 together, because the jsonl is the
+# interchange format — verified 2026-09-08 that 1.1.0 and 1.2.2 write the same
+# 24 keys over the same 76 issues, so a version skew would not have corrupted
+# anything either.
 ARG BD_VERSION=1.2.2
 RUN curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors "https://github.com/gastownhall/beads/releases/download/v${BD_VERSION}/beads_${BD_VERSION}_linux_amd64.tar.gz" \
       | tar -xz -C /usr/local/bin bd \
