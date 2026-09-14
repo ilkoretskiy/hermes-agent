@@ -20,7 +20,7 @@ logger = logging.getLogger("agent.conversation_loop")
 # Ephemeral retry scaffolding rows popped before the final answer becomes durable.
 _EPHEMERAL_SCAFFOLDING_FLAGS = (
     "_thinking_prefill", "_empty_recovery_synthetic", "_empty_terminal_sentinel",
-    "_dropped_toolcall_nudge",
+    "_dropped_toolcall_nudge", "_codex_ack_continuation_nudge",
 )
 
 
@@ -143,9 +143,14 @@ def finish_text_response(
             )
         codex_ack_continuations += 1
         interim_msg = agent._build_assistant_message(assistant_message, "incomplete")
+        interim_msg["_codex_ack_continuation_nudge"] = True
         append_message(messages, interim_msg)
         agent._emit_interim_assistant_message(interim_msg)
-        append_message(messages, {"role": "user", "content": _CODEX_ACK_CONTINUATION_NUDGE})
+        append_message(messages, {
+            "role": "user",
+            "content": _CODEX_ACK_CONTINUATION_NUDGE,
+            "_codex_ack_continuation_nudge": True,
+        })
         agent._session_messages = messages
         # An acknowledgment is non-final: its text must not suppress iteration-limit
         # summarization if the continuation exhausts budget.

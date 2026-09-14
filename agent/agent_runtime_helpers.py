@@ -2865,14 +2865,21 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
 
 
 _ACK_FUTURE_RE = re.compile(r"\b(i['’]ll|i will|let me|i can do that|i can help with that)\b")
-_ACK_ACTION_MARKERS = (
-    "look into", "look at", "inspect", "scan", "check", "analyz", "review", "explore", "read", "open",
-    "run", "test", "fix", "debug", "search", "find", "walkthrough", "report back", "summarize",
+# Word-bounded: substring matching made "repo" hit "report" and "files" hit "profiles".
+_ACK_ACTION_RE = re.compile(
+    r"\b(?:look\s+into|look\s+at|inspect|scan|check|analyz\w*|review|explore|read|open|run|test|fix|"
+    r"debug|search|find|walkthrough|report\s+back|summari[sz]\w*)\b"
 )
-_ACK_WORKSPACE_MARKERS = (
-    "directory", "current directory", "current dir", "cwd", "repo", "repository", "codebase",
-    "project", "folder", "filesystem", "file tree", "files", "path",
+_ACK_WORKSPACE_RE = re.compile(
+    r"\b(?:current\s+directory|current\s+dir|directory|cwd|repository|repo|codebase|project|folder|"
+    r"filesystem|file\s+tree|files|path)\b"
 )
+# ``~/foo``, ``./foo``, ``../foo``, ``/abs`` — a stray slash in "and/or" is not a workspace reference.
+_ACK_PATH_TOKEN_RE = re.compile(r"(?:^|[\s(\[`'\"])(?:~/|\.{1,2}/|/[A-Za-z_.\-])[\w./\-]*")
+# Quoted example dialogue and fenced code are sample text, not the assistant's own commitments
+# (a tutor turn quoting "I'll throw you a topic" must not trigger the continuation nudge).
+_ACK_FENCED_BLOCK_RE = re.compile(r"```.*?```", re.DOTALL)
+_ACK_QUOTED_DIALOGUE_RE = re.compile(r"[\"“]([^\"”]*)[\"”]")
 
 
 def looks_like_codex_intermediate_ack(
@@ -2887,9 +2894,10 @@ def looks_like_codex_intermediate_ack(
     assistant_text = agent._strip_think_blocks(assistant_content or "").strip().lower()
     if not assistant_text or len(assistant_text) > 1200:
         return False
-    if not _ACK_FUTURE_RE.search(assistant_text):
+    ack_scan_text = _ACK_QUOTED_DIALOGUE_RE.sub(" ", _ACK_FENCED_BLOCK_RE.sub(" ", assistant_text))
+    if not _ACK_FUTURE_RE.search(ack_scan_text):
         return False
-    if not any(marker in assistant_text for marker in _ACK_ACTION_MARKERS):
+    if not _ACK_ACTION_RE.search(ack_scan_text):
         return False
     # Opted-in (all-api_mode) path: future-ack + action verb + no prior tool call suffices.
     if not require_workspace:
@@ -2898,11 +2906,10 @@ def looks_like_codex_intermediate_ack(
     # list survives ``or ""`` and ``.strip()`` raises, so flatten first.
     from agent.codex_responses_adapter import _summarize_user_message_for_log
     user_text = _summarize_user_message_for_log(user_message).strip().lower()
-    return (
-        any(marker in user_text for marker in _ACK_WORKSPACE_MARKERS)
-        or "~/" in user_text
-        or "/" in user_text
-        or any(marker in assistant_text for marker in _ACK_WORKSPACE_MARKERS)
+    return any(
+        pattern.search(text)
+        for text in (user_text, ack_scan_text)
+        for pattern in (_ACK_WORKSPACE_RE, _ACK_PATH_TOKEN_RE)
     )
 
 
