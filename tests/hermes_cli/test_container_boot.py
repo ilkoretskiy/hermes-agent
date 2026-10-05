@@ -277,10 +277,13 @@ def test_managed_profiles_allowlist_skips_unlisted(
 ) -> None:
     """With an allowlist, only listed named profiles are registered;
     others (run as another container's CMD) are left alone. The default
-    slot is always registered regardless."""
+    slot is always registered regardless. The listed profile is standalone,
+    as every profile of a multi-container deploy is, so it boots its own slot
+    instead of folding into the root multiplexer."""
     monkeypatch.setenv("HERMES_GATEWAY_MANAGED_PROFILES", "inbox")
     scandir = tmp_path / "run-service"; scandir.mkdir()
-    _make_profile(tmp_path, "inbox", state="running")
+    inbox = _make_profile(tmp_path, "inbox", state="running")
+    (inbox / "config.yaml").write_text("gateway:\n  standalone: true\n")
     _make_profile(tmp_path, "family", state="running")
 
     actions = reconcile_profile_gateways(
