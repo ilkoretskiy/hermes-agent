@@ -52,11 +52,14 @@ async def test_warning_and_media_failure_do_not_seal_requested_final(tmp_path, m
     assert media.success is not (setting is True)  # legacy text fallback receipt
     assert client.chat_postMessage.await_count == (0 if setting is True else 2)
     assert client.chat_stopStream.await_count == 0
-    assert "D1" in adapter._active_streams
+    (stream,) = adapter._active_streams.values()
+    assert stream["chat_id"] == "D1"
+    assert stream["thread_anchor"] == META["thread_id"]
+    assert stream["ts"] == first.message_id
     await adapter.send_draft("D1", 7, "Requested final", metadata=META)
     result = await adapter.send("D1", "Requested final", metadata=META)
     assert result.success
     assert client.chat_startStream.await_count == 1
     assert client.chat_stopStream.await_count == 1
-    assert "D1" not in adapter._active_streams
+    assert not adapter._active_streams
     assert client.chat_postMessage.await_count == (0 if setting is True else 2)
