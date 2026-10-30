@@ -10,7 +10,7 @@ from gateway.run_turn_runner import TurnRunner
 from gateway.turn_context import TurnContext
 from gateway.session import SessionSource
 from gateway.config import Platform
-from tests.gateway.test_slack_native_streaming import _make_adapter, META
+from tests.gateway.test_slack_native_streaming import _make_adapter, _open_streams, META
 
 
 @pytest.mark.asyncio
