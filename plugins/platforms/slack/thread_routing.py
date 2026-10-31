@@ -317,13 +317,9 @@ def _safe_pattern_sequence(tokens: Any) -> bool:
                     or str(repeated[0][0]) not in _SIMPLE_REPEAT_ATOMS
                 ):
                     return False
-            elif maximum > _MAX_FINITE_REPEAT:
-                return False
-            elif maximum > 1 and (
+            elif maximum > _MAX_FINITE_REPEAT or maximum > 1 and (
                 len(repeated) != 1 or str(repeated[0][0]) not in _SIMPLE_REPEAT_ATOMS
-            ):
-                return False
-            elif maximum <= 1 and not _safe_pattern_sequence(repeated):
+            ) or maximum <= 1 and not _safe_pattern_sequence(repeated):
                 return False
             previous_unbounded_repeat = unbounded
             continue
@@ -519,7 +515,7 @@ class ThreadRoutingPolicy:
             from hermes_constants import get_hermes_home
 
             return get_hermes_home() / path
-        except Exception:  # pragma: no cover - defensive bootstrap fallback
+        except ImportError:  # pragma: no cover - standalone module bootstrap fallback
             return Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / path
 
     @staticmethod
@@ -772,7 +768,7 @@ class ThreadRoutingPolicy:
                 )
                 return {}, False
             state = json.loads(serialized.decode("utf-8"))
-        except Exception:
+        except (OSError, UnicodeError, json.JSONDecodeError):
             logger.warning("[Slack] Ignoring corrupt thread routing state")
             return {}, False
         if not isinstance(state, dict):

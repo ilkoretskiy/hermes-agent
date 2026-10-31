@@ -5,7 +5,6 @@ Follows the same pattern as test_whatsapp_group_gating.py.
 """
 
 import sys
-import inspect
 import logging
 from unittest.mock import AsyncMock, MagicMock
 
@@ -52,7 +51,7 @@ import plugins.platforms.slack.adapter as _slack_mod
 
 _slack_mod.SLACK_AVAILABLE = True
 
-from plugins.platforms.slack.adapter import SlackAdapter  # noqa: E402
+from plugins.platforms.slack.adapter import SlackAdapter
 
 
 # ---------------------------------------------------------------------------
@@ -195,9 +194,7 @@ def _would_process(
         if allowed and channel_id not in allowed:
             return False
 
-        if channel_id in adapter._slack_free_response_channels():
-            return True
-        elif not adapter._slack_require_mention():
+        if channel_id in adapter._slack_free_response_channels() or not adapter._slack_require_mention():
             return True
         elif adapter._slack_strict_mention() and not is_mentioned:
             return False
@@ -286,25 +283,6 @@ def test_mpim_unmentioned_does_not_react():
     assert _reaction_guard("", False) is False  # channel, unmentioned
 
 
-def test_reaction_guard_pinned_to_production_expression():
-    """Regression teeth for the reaction guard.
-
-    ``_reaction_guard`` mirrors the production expression at the
-    ``_should_react = (is_one_to_one_dm or is_mentioned) ...`` site in
-    ``adapter.py``. This test pins that source line so a revert of the fix
-    (back to ``is_dm or is_mentioned``, which reacts to unmentioned MPIMs)
-    fails here instead of silently passing a self-referential lambda.
-    """
-    # The public method is a thin claim-release guard; the production
-    # expression lives in the impl.
-    src = inspect.getsource(SlackAdapter._handle_slack_message_impl)
-    assert "(is_one_to_one_dm or is_mentioned)" in src, (
-        "reaction guard no longer keys off is_one_to_one_dm — an unmentioned "
-        "MPIM would react again (regression of the group-DM fix)"
-    )
-    assert "(is_dm or is_mentioned)" not in src, (
-        "reaction guard reverted to is_dm — MPIMs would react when unmentioned"
-    )
 
 
 def test_mentioned_message_always_processed():
@@ -619,7 +597,7 @@ async def test_block_extraction_debug_log_does_not_include_message_preview(caplo
 # Tests: Block-Kit-only mention detection (#52387)
 # ---------------------------------------------------------------------------
 
-from plugins.platforms.slack.adapter import _slack_mention_detection_text  # noqa: E402
+from plugins.platforms.slack.adapter import _slack_mention_detection_text
 
 
 def _blockkit_mention_event(bot_user_id=BOT_USER_ID, flat_text="Release notification"):

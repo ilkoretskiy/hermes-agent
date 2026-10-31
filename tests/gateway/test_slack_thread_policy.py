@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-import plugins.platforms.slack.thread_routing as thread_routing
+from plugins.platforms.slack import thread_routing
 from plugins.platforms.slack.thread_routing import (
     RoutingContext,
     RoutingDisposition,
@@ -538,6 +538,7 @@ def test_later_stop_survives_concurrent_resume(tmp_path, monkeypatch):
     real_read_state = policy._read_state
     resume_read = threading.Event()
     release_resume = threading.Event()
+    stop_started = threading.Event()
 
     class PausingState(dict):
         def get(self, key, default=None):
@@ -552,17 +553,18 @@ def test_later_stop_survives_concurrent_resume(tmp_path, monkeypatch):
 
     monkeypatch.setattr(policy, "_read_state", pausing_read_state)
 
+    def stop_after_resume():
+        stop_started.set()
+        return policy.evaluate(_context("stop responding", direct_bot_mention=True))
+
     with ThreadPoolExecutor(max_workers=2) as executor:
         resume_future = executor.submit(
             policy.evaluate,
             _context("unmute", direct_bot_mention=True),
         )
         assert resume_read.wait(timeout=2)
-        stop_future = executor.submit(
-            policy.evaluate,
-            _context("stop responding", direct_bot_mention=True),
-        )
-        time.sleep(0.05)
+        stop_future = executor.submit(stop_after_resume)
+        assert stop_started.wait(timeout=2)
         assert not stop_future.done()
         release_resume.set()
         resume = resume_future.result(timeout=2)
