@@ -19,6 +19,8 @@ from hermes_cli.container_boot import (
     reconcile_profile_gateways,
 )
 
+pytestmark = pytest.mark.platforms("linux")
+
 
 # ---------------------------------------------------------------------------
 # Fixtures + helpers
@@ -46,6 +48,8 @@ def _hermetic_container_argv(monkeypatch: pytest.MonkeyPatch) -> None:
         "hermes_cli.container_boot._read_container_argv",
         lambda: (),
     )
+    # This fixture owns real files, but does not run as the image's service user.
+    monkeypatch.setattr("hermes_cli.service_manager._chown_hermes", lambda path: None)
 
 
 def _make_profile(
@@ -297,6 +301,7 @@ def test_managed_profiles_allowlist_skips_unlisted(
     assert not (scandir / "gateway-family").exists()
     # Default slot still registered as the bare-`gateway start` landing pad.
     assert (scandir / "gateway-default").is_dir()
+    assert (scandir / "gateway-default" / "down").exists()
 
 
 def test_managed_profiles_accepts_whitespace_and_blanks(

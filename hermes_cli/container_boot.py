@@ -112,7 +112,7 @@ def reconcile_profile_gateways(
     so it is what ``hermes gateway start`` (no ``-p``) targets.
 
     Without it, bare ``hermes gateway start`` inside the container would land on ``s6-svc -u
-    /run/service/gateway-default`` → uncaught ``CalledProcessError`` → traceback to the user (PR #30136
+    /run/hermes-service/gateway-default`` → uncaught ``CalledProcessError`` → traceback to the user (PR #30136
     review).
 
     Multi-container knobs (several containers sharing one ``$HERMES_HOME`` volume):
@@ -129,7 +129,7 @@ def reconcile_profile_gateways(
         log.info("HERMES_GATEWAY_RECONCILE_DISABLED set — skipping profile gateway "
                  "reconciliation (this container supervises no profiles)")
         return []
-    managed = _parse_managed_profiles(os.environ.get("HERMES_GATEWAY_MANAGED_PROFILES", ""))
+    managed = _parse_managed_profiles(os.environ.get("HERMES_GATEWAY_MANAGED_PROFILES", ""))  # health: allow HX002 -- shared-volume containers need distinct gateway ownership
     actions: list[ReconcileAction] = []
     # ONE multiplexing gateway per container: named slots are registered (so `hermes -p X gateway
     # start` has a target and `s6-svstat` can report them) but are never booted from their persisted
@@ -147,7 +147,6 @@ def reconcile_profile_gateways(
              if managed is None or name in managed]
     # The exception is a `gateway.standalone` profile: the root multiplexer never serves it
     # (profiles_to_serve excludes it), so it boots its own slot from its own intent, beside the root.
-    # Backport of upstream 8e9d1b90c9 (#120524), which landed after v0.21.5.
     from hermes_cli.profiles import profile_is_standalone
     standalone = {name for name, entry, _prior in named if profile_is_standalone(entry)}
 
@@ -187,7 +186,7 @@ def reconcile_profile_gateways(
 def boot_notice(folded: Sequence[str]) -> str:
     """One line naming the profiles whose autostart intent the root slot took over."""
     return ("reconcile: profile gateway(s) " + ", ".join(sorted(folded)) +
-            " asked to autostart; one gateway per container serves every profile, so the ROOT "
+            " asked to autostart; one gateway per container serves every non-standalone profile, so the ROOT "
             "slot (gateway-default) was started instead and multiplexes them.")
 
 
@@ -281,7 +280,7 @@ def _read_desired_state(profile_dir: Path) -> str | None:
     if not state_file.exists():
         return None
     try:
-        data = json.loads(state_file.read_text(encoding="utf-8"))
+        data = json.loads(state_file.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError):
         log.warning("could not read %s; treating as no prior state", state_file)
         return None
@@ -398,8 +397,10 @@ def main() -> int:
         print("reconcile: skipping (dashboard container — does not need per-profile gateways)")
         return 0
 
+    from hermes_cli.service_manager import S6_DYNAMIC_SCANDIR
+
     hermes_home = Path(os.environ.get("HERMES_HOME", "/opt/data"))
-    scandir = Path(os.environ.get("S6_PROFILE_GATEWAY_SCANDIR", "/run/service"))
+    scandir = Path(os.environ.get("S6_PROFILE_GATEWAY_SCANDIR", str(S6_DYNAMIC_SCANDIR)))
     actions = reconcile_profile_gateways(hermes_home=hermes_home, scandir=scandir)
     folded = [a.profile for a in actions if a.profile != "default" and a.folded_into_root]
     if folded:
